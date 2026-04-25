@@ -11,8 +11,24 @@ from .track_modules.base_track_predictor import BaseTrackerPredictor
 
 class TrackHead(nn.Module):
     """
-    Track head that uses DPT head to process tokens and BaseTrackerPredictor for tracking.
-    The tracking is performed iteratively, refining predictions over multiple iterations.
+    【TrackHead - 追踪头】
+    对输入图像中的指定查询点进行跨帧追踪。
+
+    结构:
+        1. Feature Extractor: 基于 DPTHead (feature_only=True, down_ratio=2)
+           从 Aggregator token 中提取多尺度特征图
+           输出特征图分辨率: H//2 x W//2
+        2. Tracker: BaseTrackerPredictor, 基于 RAFT/Cotracker 风格的 correlation-based tracker
+           通过多轮迭代 refine 追踪坐标
+
+    输出:
+        - coord_preds (list[Tensor]): 每轮迭代的追踪坐标预测
+          每个元素 [B, S, N, 2], 像素坐标
+        - vis_scores (Tensor): 可见性分数 [B, S, N]
+          表示查询点在各帧是否可见
+        - conf_scores (Tensor): 追踪置信度 [B, S, N]
+
+    注意: VGGT.forward() 中只取 coord_preds 的最后一项: track = coord_preds[-1]
     """
 
     def __init__(
@@ -71,34 +87,34 @@ class TrackHead(nn.Module):
 
     def forward(self, aggregated_tokens_list, images, patch_start_idx, query_points=None, iters=None):
         """
-        Forward pass of the TrackHead.
+        【TrackHead 前向传播】
 
         Args:
-            aggregated_tokens_list (list): List of aggregated tokens from the backbone.
-            images (torch.Tensor): Input images of shape (B, S, C, H, W) where:
-                                   B = batch size, S = sequence length.
-            patch_start_idx (int): Starting index for patch tokens.
-            query_points (torch.Tensor, optional): Initial query points to track.
-                                                  If None, points are initialized by the tracker.
-            iters (int, optional): Number of refinement iterations. If None, uses self.iters.
+            aggregated_tokens_list (list): Aggregator 各层 token 列表
+            images (torch.Tensor): 输入图像 (B, S, C, H, W)
+            patch_start_idx (int): patch tokens 起始索引
+            query_points (torch.Tensor, optional): 待追踪的查询点 [B, N, 2], 像素坐标
+                若为 None, 由 tracker 自动初始化
+            iters (int, optional): 迭代轮数, 默认 self.iters (默认 4)
 
         Returns:
             tuple:
-                - coord_preds (torch.Tensor): Predicted coordinates for tracked points.
-                - vis_scores (torch.Tensor): Visibility scores for tracked points.
-                - conf_scores (torch.Tensor): Confidence scores for tracked points (if predict_conf=True).
+                - coord_preds (list[Tensor]): 每轮迭代的追踪坐标 [B, S, N, 2]
+                - vis_scores (Tensor): 可见性分数 [B, S, N]
+                - conf_scores (Tensor): 置信度 [B, S, N]
         """
         B, S, _, H, W = images.shape
 
-        # Extract features from tokens
-        # feature_maps has shape (B, S, C, H//2, W//2) due to down_ratio=2
+        # 【Step 1: 提取追踪特征】
+        # feature_maps 形状: (B, S, C, H//2, W//2) 因为 down_ratio=2
         feature_maps = self.feature_extractor(aggregated_tokens_list, images, patch_start_idx)
 
-        # Use default iterations if not specified
         if iters is None:
             iters = self.iters
 
-        # Perform tracking using the extracted features
-        coord_preds, vis_scores, conf_scores = self.tracker(query_points=query_points, fmaps=feature_maps, iters=iters)
+        # 【Step 2: 迭代追踪】
+        coord_preds, vis_scores, conf_scores = self.tracker(
+            query_points=query_points, fmaps=feature_maps, iters=iters
+        )
 
         return coord_preds, vis_scores, conf_scores

@@ -63,35 +63,81 @@ def parse_args():
 
 
 def run_VGGT(model, images, dtype, resolution=518):
+    """
+    【VGGT 推理核心 - 重点阅读】
+    运行 VGGT 模型, 提取相机参数和深度图。
+
+    输出流程:
+        1. Aggregator 提取特征
+        2. CameraHead 输出 pose_enc -> pose_encoding_to_extri_intri 解码为:
+           - extrinsic (S, 3, 4): 外参矩阵, OpenCV camera-from-world
+           - intrinsic (S, 3, 3): 内参矩阵
+        3. DepthHead 输出:
+           - depth_map (S, 1, H, W): 深度图
+           - depth_conf (S, 1, H, W): 深度置信度
+
+    Args:
+        model: VGGT 模型实例
+        images (Tensor): 输入图像 [B, 3, H, W], 范围 [0, 1]
+        dtype: 推理精度 (bfloat16 或 float16)
+        resolution (int): VGGT 固定处理分辨率 (默认 518)
+
+    Returns:
+        tuple: (extrinsic, intrinsic, depth_map, depth_conf) 均为 numpy 数组
+    """
     # images: [B, 3, H, W]
 
     assert len(images.shape) == 4
     assert images.shape[1] == 3
 
-    # hard-coded to use 518 for VGGT
+    # VGGT 固定使用 518x518 分辨率
     images = F.interpolate(images, size=(resolution, resolution), mode="bilinear", align_corners=False)
 
     with torch.no_grad():
         with torch.cuda.amp.autocast(dtype=dtype):
-            images = images[None]  # add batch dimension
+            images = images[None]  # 添加 batch 维度: [1, B, 3, H, W]
+            # 【Step 1: 特征聚合】
             aggregated_tokens_list, ps_idx = model.aggregator(images)
 
-        # Predict Cameras
+        # 【Step 2: 相机预测】
         pose_enc = model.camera_head(aggregated_tokens_list)[-1]
-        # Extrinsic and intrinsic matrices, following OpenCV convention (camera from world)
+        # 【关键解码】pose_enc -> 外参 + 内参, OpenCV camera-from-world 约定
         extrinsic, intrinsic = pose_encoding_to_extri_intri(pose_enc, images.shape[-2:])
-        # Predict Depth Maps
+
+        # 【Step 3: 深度预测】
         depth_map, depth_conf = model.depth_head(aggregated_tokens_list, images, ps_idx)
 
-    extrinsic = extrinsic.squeeze(0).cpu().numpy()
-    intrinsic = intrinsic.squeeze(0).cpu().numpy()
-    depth_map = depth_map.squeeze(0).cpu().numpy()
-    depth_conf = depth_conf.squeeze(0).cpu().numpy()
+    # 移除 batch 维度并转为 numpy
+    extrinsic = extrinsic.squeeze(0).cpu().numpy()    # (S, 3, 4)
+    intrinsic = intrinsic.squeeze(0).cpu().numpy()    # (S, 3, 3)
+    depth_map = depth_map.squeeze(0).cpu().numpy()    # (S, 1, H, W)
+    depth_conf = depth_conf.squeeze(0).cpu().numpy()  # (S, 1, H, W)
     return extrinsic, intrinsic, depth_map, depth_conf
 
 
 def demo_fn(args):
-    # Print configuration
+    """
+    【COLMAP 导出完整流程 - 重点阅读】
+
+    整体流程:
+        1. 加载并预处理图像 (1024分辨率)
+        2. VGGT 推理: 提取相机参数 + 深度图 (518分辨率)
+        3. 深度图反投影为 3D 点云 (unproject_depth_map_to_point_map)
+        4. (可选 BA) 使用追踪点进行 bundle adjustment 优化
+        5. 保存为 COLMAP 格式 (cameras.bin, images.bin, points3D.bin)
+
+    输出目录结构:
+        SCENE_DIR/
+        ├── images/
+        └── sparse/
+            ├── cameras.bin
+            ├── images.bin
+            └── points3D.bin
+
+    Args:
+        args: 命令行参数
+    """
+    # 打印配置
     print("Arguments:", vars(args))
 
     # Set seed for reproducibility
@@ -124,8 +170,7 @@ def demo_fn(args):
         raise ValueError(f"No images found in {image_dir}")
     base_image_path_list = [os.path.basename(path) for path in image_path_list]
 
-    # Load images and original coordinates
-    # Load Image in 1024, while running VGGT with 518
+    # 加载图像 (1024分辨率用于后续处理, 但 VGGT 内部固定用 518)
     vggt_fixed_resolution = 518
     img_load_resolution = 1024
 
@@ -134,24 +179,26 @@ def demo_fn(args):
     original_coords = original_coords.to(device)
     print(f"Loaded {len(images)} images from {image_dir}")
 
-    # Run VGGT to estimate camera and depth
-    # Run with 518x518 images
+    # 【Step 1: VGGT 推理】得到相机参数和深度图 (518分辨率)
     extrinsic, intrinsic, depth_map, depth_conf = run_VGGT(model, images, dtype, vggt_fixed_resolution)
+
+    # 【Step 2: 深度图反投影为 3D 点云】
+    # extrinsic (S,3,4) + intrinsic (S,3,3) + depth_map (S,1,H,W) => points_3d (S,H,W,3)
     points_3d = unproject_depth_map_to_point_map(depth_map, extrinsic, intrinsic)
 
     if args.use_ba:
+        # 【带 Bundle Adjustment 的模式】
         image_size = np.array(images.shape[-2:])
         scale = img_load_resolution / vggt_fixed_resolution
         shared_camera = args.shared_camera
 
         with torch.cuda.amp.autocast(dtype=dtype):
-            # Predicting Tracks
-            # Using VGGSfM tracker instead of VGGT tracker for efficiency
-            # VGGT tracker requires multiple backbone runs to query different frames (this is a problem caused by the training process)
-            # Will be fixed in VGGT v2
-
-            # You can also change the pred_tracks to tracks from any other methods
-            # e.g., from COLMAP, from CoTracker, or by chaining 2D matches from Lightglue/LoFTR.
+            # 【追踪预测】使用 VGGSfM tracker (比 VGGT tracker 更高效)
+            # 输出:
+            #   - pred_tracks: 追踪点坐标 (用于 BA)
+            #   - pred_vis_scores: 可见性分数
+            #   - points_3d: 优化后的 3D 点
+            #   - points_rgb: 点云颜色
             pred_tracks, pred_vis_scores, pred_confs, points_3d, points_rgb = predict_tracks(
                 images,
                 conf=depth_conf,
@@ -165,11 +212,11 @@ def demo_fn(args):
 
             torch.cuda.empty_cache()
 
-        # rescale the intrinsic matrix from 518 to 1024
+        # 将内参从 518 分辨率缩放到 1024 分辨率
         intrinsic[:, :2, :] *= scale
         track_mask = pred_vis_scores > args.vis_thresh
 
-        # TODO: radial distortion, iterative BA, masks
+        # 【Step 3: 构建 COLMAP reconstruction 对象】
         reconstruction, valid_track_mask = batch_np_matrix_to_pycolmap(
             points_3d,
             extrinsic,
@@ -186,31 +233,34 @@ def demo_fn(args):
         if reconstruction is None:
             raise ValueError("No reconstruction can be built with BA")
 
-        # Bundle Adjustment
+        # 【Step 4: Bundle Adjustment 优化】
         ba_options = pycolmap.BundleAdjustmentOptions()
         pycolmap.bundle_adjustment(reconstruction, ba_options)
 
         reconstruction_resolution = img_load_resolution
     else:
+        # 【纯前馈模式 (无 BA)】
         conf_thres_value = args.conf_thres_value
-        max_points_for_colmap = 100000  # randomly sample 3D points
-        shared_camera = False  # in the feedforward manner, we do not support shared camera
-        camera_type = "PINHOLE"  # in the feedforward manner, we only support PINHOLE camera
+        max_points_for_colmap = 100000  # 最多保留 10万 个 3D 点
+        shared_camera = False  # 前馈模式不支持共享相机
+        camera_type = "PINHOLE"  # 前馈模式只支持 PINHOLE 相机
 
         image_size = np.array([vggt_fixed_resolution, vggt_fixed_resolution])
         num_frames, height, width, _ = points_3d.shape
 
+        # 获取点云颜色 (从输入图像插值)
         points_rgb = F.interpolate(
             images, size=(vggt_fixed_resolution, vggt_fixed_resolution), mode="bilinear", align_corners=False
         )
         points_rgb = (points_rgb.cpu().numpy() * 255).astype(np.uint8)
         points_rgb = points_rgb.transpose(0, 2, 3, 1)
 
-        # (S, H, W, 3), with x, y coordinates and frame indices
+        # 像素坐标网格: (S, H, W, 3), 包含 (x, y, frame_idx)
         points_xyf = create_pixel_coordinate_grid(num_frames, height, width)
 
+        # 按置信度过滤点云
         conf_mask = depth_conf >= conf_thres_value
-        # at most writing 100000 3d points to colmap reconstruction object
+        # 随机采样, 限制最多 10万 点
         conf_mask = randomly_limit_trues(conf_mask, max_points_for_colmap)
 
         points_3d = points_3d[conf_mask]

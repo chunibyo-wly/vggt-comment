@@ -16,15 +16,26 @@ def unproject_depth_map_to_point_map(
     depth_map: np.ndarray, extrinsics_cam: np.ndarray, intrinsics_cam: np.ndarray
 ) -> np.ndarray:
     """
-    Unproject a batch of depth maps to 3D world coordinates.
+    【核心函数 - 重点阅读】将深度图反投影为 3D 世界坐标点云。
+
+    这是将 VGGT 的 depth + camera 输出转换为 3D 点云的关键步骤!
+    原理: 深度图 + 相机内外参 => 3D 世界坐标
+
+    流程:
+        1. 对每帧: 深度图 + 内参 => 相机坐标系下的 3D 点 (depth_to_cam_coords_points)
+        2. 外参的逆变换 => 世界坐标系下的 3D 点
+
+    注意: 通常情况下, depth-based 点云比 point_head 直接输出的 world_points 更准确!
+          README 中也提到: "Construct 3D Points from Depth Maps and Cameras ...
+          which usually leads to more accurate 3D points than point map branch"
 
     Args:
-        depth_map (np.ndarray): Batch of depth maps of shape (S, H, W, 1) or (S, H, W)
-        extrinsics_cam (np.ndarray): Batch of camera extrinsic matrices of shape (S, 3, 4)
-        intrinsics_cam (np.ndarray): Batch of camera intrinsic matrices of shape (S, 3, 3)
+        depth_map (np.ndarray): 深度图批次 (S, H, W, 1) 或 (S, H, W)
+        extrinsics_cam (np.ndarray): 外参矩阵批次 (S, 3, 4), OpenCV camera-from-world 格式
+        intrinsics_cam (np.ndarray): 内参矩阵批次 (S, 3, 3)
 
     Returns:
-        np.ndarray: Batch of 3D world coordinates of shape (S, H, W, 3)
+        np.ndarray: 世界坐标系 3D 点 (S, H, W, 3)
     """
     if isinstance(depth_map, torch.Tensor):
         depth_map = depth_map.cpu().numpy()
@@ -51,15 +62,23 @@ def depth_to_world_coords_points(
     eps=1e-8,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
-    Convert a depth map to world coordinates.
+    【单帧深度图反投影】将单帧深度图转换为世界坐标。
+
+    坐标变换链:
+        像素坐标 (u,v) + 深度 Z
+            => 相机坐标 (X_cam, Y_cam, Z)   [通过内参反投影]
+            => 世界坐标 (X_world, Y_world, Z_world) [通过外参逆变换]
 
     Args:
-        depth_map (np.ndarray): Depth map of shape (H, W).
-        intrinsic (np.ndarray): Camera intrinsic matrix of shape (3, 3).
-        extrinsic (np.ndarray): Camera extrinsic matrix of shape (3, 4). OpenCV camera coordinate convention, cam from world.
+        depth_map (np.ndarray): 深度图 (H, W)
+        intrinsic (np.ndarray): 内参矩阵 (3, 3)
+        extrinsic (np.ndarray): 外参矩阵 (3, 4), OpenCV camera-from-world
 
     Returns:
-        tuple[np.ndarray, np.ndarray]: World coordinates (H, W, 3) and valid depth mask (H, W).
+        tuple:
+            - world_coords (H, W, 3): 世界坐标
+            - cam_coords (H, W, 3): 相机坐标
+            - point_mask (H, W): 有效深度掩码 (depth > eps)
     """
     if depth_map is None:
         return None, None, None
@@ -86,14 +105,19 @@ def depth_to_world_coords_points(
 
 def depth_to_cam_coords_points(depth_map: np.ndarray, intrinsic: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     """
-    Convert a depth map to camera coordinates.
+    【深度图反投影到相机坐标系】
+
+    公式:
+        X_cam = (u - cx) * Z / fx
+        Y_cam = (v - cy) * Z / fy
+        Z_cam = Z (深度值)
 
     Args:
-        depth_map (np.ndarray): Depth map of shape (H, W).
-        intrinsic (np.ndarray): Camera intrinsic matrix of shape (3, 3).
+        depth_map (np.ndarray): 深度图 (H, W)
+        intrinsic (np.ndarray): 内参矩阵 (3, 3)
 
     Returns:
-        tuple[np.ndarray, np.ndarray]: Camera coordinates (H, W, 3)
+        tuple[np.ndarray, np.ndarray]: 相机坐标系 3D 点 (H, W, 3)
     """
     H, W = depth_map.shape
     assert intrinsic.shape == (3, 3), "Intrinsic matrix must be 3x3"

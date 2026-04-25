@@ -12,21 +12,27 @@ import numpy as np
 
 def load_and_preprocess_images_square(image_path_list, target_size=1024):
     """
-    Load and preprocess images by center padding to square and resizing to target size.
-    Also returns the position information of original pixels after transformation.
+    【图像加载与预处理 - 重点阅读】
+    将图像通过中心填充变为正方形, 然后缩放到目标尺寸。
+    同时返回原始图像在目标尺寸中的位置信息 (用于后续坐标映射)。
+
+    处理流程:
+        1. 读取图像 (支持 RGBA, 会自动合成到白色背景)
+        2. 短边中心填充为黑色, 变为正方形
+        3. 缩放到 target_size x target_size
+        4. 计算原始图像在目标尺寸中的坐标范围
+
+    输出:
+        - images (N, 3, target_size, target_size): 预处理后的图像张量, 范围 [0, 1]
+        - original_coords (N, 5): [x1, y1, x2, y2, width, height]
+          表示原始图像在 target_size 图像中的左上角和右下角像素坐标
 
     Args:
-        image_path_list (list): List of paths to image files
-        target_size (int, optional): Target size for both width and height. Defaults to 518.
+        image_path_list (list): 图像文件路径列表
+        target_size (int, optional): 目标尺寸 (默认 1024, demo_colmap 中使用)
 
     Returns:
-        tuple: (
-            torch.Tensor: Batched tensor of preprocessed images with shape (N, 3, target_size, target_size),
-            torch.Tensor: Array of shape (N, 5) containing [x1, y1, x2, y2, width, height] for each image
-        )
-
-    Raises:
-        ValueError: If the input list is empty
+        tuple: (images, original_coords)
     """
     # Check for empty list
     if len(image_path_list) == 0:
@@ -96,30 +102,25 @@ def load_and_preprocess_images_square(image_path_list, target_size=1024):
 
 def load_and_preprocess_images(image_path_list, mode="crop"):
     """
-    A quick start function to load and preprocess images for model input.
-    This assumes the images should have the same shape for easier batching, but our model can also work well with different shapes.
+    【快速入门图像预处理】用于模型输入的图像加载与预处理。
+
+    两种模式:
+        - "crop" (默认): 宽度固定为 518, 高度按比例缩放后中心裁剪为 518
+          【会丢失部分像素, 但保证所有图像严格 518x518】
+        - "pad": 长边固定为 518, 短边按比例缩放后填充到 518
+          【保留所有像素, 但可能引入白色填充区域】
+
+    重要约束:
+        - 尺寸必须能被 14 整除 (patch_size=14)
+        - 输出范围 [0, 1]
+        - 不同尺寸的图像会自动用白色填充对齐
 
     Args:
-        image_path_list (list): List of paths to image files
-        mode (str, optional): Preprocessing mode, either "crop" or "pad".
-                             - "crop" (default): Sets width to 518px and center crops height if needed.
-                             - "pad": Preserves all pixels by making the largest dimension 518px
-                               and padding the smaller dimension to reach a square shape.
+        image_path_list (list): 图像文件路径列表
+        mode (str, optional): "crop" 或 "pad" (默认 "crop")
 
     Returns:
-        torch.Tensor: Batched tensor of preprocessed images with shape (N, 3, H, W)
-
-    Raises:
-        ValueError: If the input list is empty or if mode is invalid
-
-    Notes:
-        - Images with different dimensions will be padded with white (value=1.0)
-        - A warning is printed when images have different shapes
-        - When mode="crop": The function ensures width=518px while maintaining aspect ratio
-          and height is center-cropped if larger than 518px
-        - When mode="pad": The function ensures the largest dimension is 518px while maintaining aspect ratio
-          and the smaller dimension is padded to reach a square shape (518x518)
-        - Dimensions are adjusted to be divisible by 14 for compatibility with model requirements
+        torch.Tensor: 预处理后的图像张量 (N, 3, H, W), 范围 [0, 1]
     """
     # Check for empty list
     if len(image_path_list) == 0:

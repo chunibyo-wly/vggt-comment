@@ -41,47 +41,62 @@ def viser_wrapper(
     image_folder: str = None,
 ):
     """
-    Visualize predicted 3D points and camera poses with viser.
+    【Viser 可视化 - 重点阅读】
+    使用 viser 库可视化 VGGT 的 3D 预测结果 (点云 + 相机)。
+
+    输入 pred_dict 字典结构 (由 demo_viser.py 的主流程构建):
+        {
+            "images":        (S, 3, H, W)   - 输入图像
+            "world_points":  (S, H, W, 3)   - 点云头直接输出的世界坐标 (可选)
+            "world_points_conf": (S, H, W)  - 点云置信度 (可选)
+            "depth":         (S, H, W, 1)   - 深度图
+            "depth_conf":    (S, H, W)      - 深度置信度
+            "extrinsic":     (S, 3, 4)      - 相机外参矩阵, OpenCV camera-from-world
+            "intrinsic":     (S, 3, 3)      - 相机内参矩阵
+        }
+
+    点云来源选择:
+        - use_point_map=False (默认, 推荐): 使用 depth + camera 反投影的点云
+          调用 unproject_depth_map_to_point_map()
+        - use_point_map=True: 使用 point_head 直接输出的 world_points
+
+    可视化内容:
+        1. 3D 点云 (可按置信度过滤)
+        2. 相机位姿 (以视锥体形式显示)
+        3. 每帧对应的图像纹理
 
     Args:
-        pred_dict (dict):
-            {
-                "images": (S, 3, H, W)   - Input images,
-                "world_points": (S, H, W, 3),
-                "world_points_conf": (S, H, W),
-                "depth": (S, H, W, 1),
-                "depth_conf": (S, H, W),
-                "extrinsic": (S, 3, 4),
-                "intrinsic": (S, 3, 3),
-            }
-        port (int): Port number for the viser server.
-        init_conf_threshold (float): Initial percentage of low-confidence points to filter out.
-        use_point_map (bool): Whether to visualize world_points or use depth-based points.
-        background_mode (bool): Whether to run the server in background thread.
-        mask_sky (bool): Whether to apply sky segmentation to filter out sky points.
-        image_folder (str): Path to the folder containing input images.
+        pred_dict (dict): VGGT 预测结果字典
+        port (int): viser 服务器端口
+        init_conf_threshold (float): 初始置信度过滤百分比 (默认 50.0)
+        use_point_map (bool): 是否使用 point_head 直接输出的点云
+        background_mode (bool): 是否在后台线程运行
+        mask_sky (bool): 是否进行天空分割过滤
+        image_folder (str): 输入图像文件夹路径
     """
     print(f"Starting viser server on port {port}")
 
     server = viser.ViserServer(host="0.0.0.0", port=port)
     server.gui.configure_theme(titlebar_content=None, control_layout="collapsible")
 
-    # Unpack prediction dict
+    # 【解析预测结果】
     images = pred_dict["images"]  # (S, 3, H, W)
-    world_points_map = pred_dict["world_points"]  # (S, H, W, 3)
+    world_points_map = pred_dict["world_points"]  # (S, H, W, 3) - 点云头直接输出
     conf_map = pred_dict["world_points_conf"]  # (S, H, W)
 
     depth_map = pred_dict["depth"]  # (S, H, W, 1)
     depth_conf = pred_dict["depth_conf"]  # (S, H, W)
 
-    extrinsics_cam = pred_dict["extrinsic"]  # (S, 3, 4)
+    extrinsics_cam = pred_dict["extrinsic"]  # (S, 3, 4) - camera-from-world
     intrinsics_cam = pred_dict["intrinsic"]  # (S, 3, 3)
 
-    # Compute world points from depth if not using the precomputed point map
+    # 【选择点云来源】
     if not use_point_map:
+        # 【推荐】使用 depth + camera 反投影的点云, 通常更准确
         world_points = unproject_depth_map_to_point_map(depth_map, extrinsics_cam, intrinsics_cam)
         conf = depth_conf
     else:
+        # 使用 point_head 直接输出的 world_points
         world_points = world_points_map
         conf = conf_map
 

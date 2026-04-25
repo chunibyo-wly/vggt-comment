@@ -20,24 +20,42 @@ from .utils import create_uv_grid, position_grid_to_embed
 
 class DPTHead(nn.Module):
     """
-    DPT  Head for dense prediction tasks.
+    【DPTHead - 密集预测头, 重点阅读】
+    DPT (Vision Transformers for Dense Prediction) 风格的解码器头。
+    用于深度估计 (Depth Head) 和点云估计 (Point Head)。
 
-    This implementation follows the architecture described in "Vision Transformers for Dense Prediction"
-    (https://arxiv.org/abs/2103.13413). The DPT head processes features from a vision transformer
-    backbone and produces dense predictions by fusing multi-scale features.
+    算法原理:
+        1. 从 Aggregator 的多个中间层提取特征 (默认取第 4, 11, 17, 23 层)
+        2. 将不同尺度的 token 特征重塑为 2D 特征图
+        3. 通过不同倍率的上/下采样对齐分辨率:
+           - layer 4:  4x 上采样
+           - layer 11: 2x 上采样
+           - layer 17: 不变
+           - layer 23: 2x 下采样
+        4. 使用 Feature Fusion Block 从深层到浅层逐步融合特征
+        5. 最终通过卷积输出 dense prediction
+
+    输出格式 (非 feature_only 模式):
+        - preds: [B, S, output_dim-1, H, W]  预测值 (深度或3D坐标)
+        - conf:  [B, S, 1, H, W]             置信度
+
+        注意: output_conv2 输出 output_dim 通道, activate_head 将其拆分为:
+              preds (前 output_dim-1 通道) 和 conf (最后1通道)
 
     Args:
-        dim_in (int): Input dimension (channels).
-        patch_size (int, optional): Patch size. Default is 14.
-        output_dim (int, optional): Number of output channels. Default is 4.
-        activation (str, optional): Activation type. Default is "inv_log".
-        conf_activation (str, optional): Confidence activation type. Default is "expp1".
-        features (int, optional): Feature channels for intermediate representations. Default is 256.
-        out_channels (List[int], optional): Output channels for each intermediate layer.
-        intermediate_layer_idx (List[int], optional): Indices of layers from aggregated tokens used for DPT.
-        pos_embed (bool, optional): Whether to use positional embedding. Default is True.
-        feature_only (bool, optional): If True, return features only without the last several layers and activation head. Default is False.
-        down_ratio (int, optional): Downscaling factor for the output resolution. Default is 1.
+        dim_in (int): 输入维度 (2*embed_dim = 2048)
+        patch_size (int): Patch 大小 (默认 14)
+        output_dim (int): 输出通道数
+            - depth head: 2  (1维深度 + 1维置信度)
+            - point head: 4  (3维坐标 + 1维置信度)
+        activation (str): 预测值激活函数 ("exp" 用于深度, "inv_log" 用于点云)
+        conf_activation (str): 置信度激活函数 (默认 "expp1")
+        features (int): 中间特征维度 (默认 256)
+        out_channels (List[int]): 各层投影输出通道
+        intermediate_layer_idx (List[int]): 使用的 Aggregator 中间层索引
+        pos_embed (bool): 是否使用位置编码
+        feature_only (bool): 若 True, 只返回融合后的特征图
+        down_ratio (int): 输出分辨率下采样倍数
     """
 
     def __init__(
@@ -120,19 +138,23 @@ class DPTHead(nn.Module):
         frames_chunk_size: int = 8,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         """
-        Forward pass through the DPT head, supports processing by chunking frames.
+        【DPTHead 前向传播 - 重点阅读】
+        支持分块 (chunking) 处理帧以控制显存。
+
         Args:
-            aggregated_tokens_list (List[Tensor]): List of token tensors from different transformer layers.
-            images (Tensor): Input images with shape [B, S, 3, H, W], in range [0, 1].
-            patch_start_idx (int): Starting index for patch tokens in the token sequence.
-                Used to separate patch tokens from other tokens (e.g., camera or register tokens).
-            frames_chunk_size (int, optional): Number of frames to process in each chunk.
-                If None or larger than S, all frames are processed at once. Default: 8.
+            aggregated_tokens_list (List[Tensor]): Aggregator 各层输出的 token 列表
+            images (Tensor): 输入图像 [B, S, 3, H, W], 范围 [0, 1]
+            patch_start_idx (int): patch tokens 在 token 序列中的起始索引
+                【用于跳过 camera token 和 register tokens, 只取 patch tokens】
+            frames_chunk_size (int, optional): 每批处理的帧数 (默认 8)
+                若 None 或大于 S, 则一次性处理所有帧
 
         Returns:
             Tensor or Tuple[Tensor, Tensor]:
-                - If feature_only=True: Feature maps with shape [B, S, C, H, W]
-                - Otherwise: Tuple of (predictions, confidence) both with shape [B, S, 1, H, W]
+                - feature_only=True: 特征图 [B, S, C, H, W]
+                - 否则: (predictions, confidence)
+                    - depth head:  ([B, S, 1, H, W], [B, S, 1, H, W])
+                    - point head: ([B, S, 3, H, W], [B, S, 1, H, W])
         """
         B, S, _, H, W = images.shape
 
@@ -178,19 +200,27 @@ class DPTHead(nn.Module):
         frames_end_idx: int = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         """
-        Implementation of the forward pass through the DPT head.
+        【DPTHead 核心实现 - 重点阅读】
+        处理指定帧块的前向传播。
 
-        This method processes a specific chunk of frames from the sequence.
+        流程:
+            1. 从 4 个中间层取 patch tokens (跳过 special tokens)
+            2. 将 [B*S, num_patches, C] 重塑为 [B*S, C, patch_h, patch_w] 的 2D 特征图
+            3. 1x1 卷积投影到目标通道数
+            4. 上/下采样对齐分辨率
+            5. 通过 scratch_forward 融合多层特征
+            6. 双线性插值到目标分辨率
+            7. output_conv2 输出预测, activate_head 拆分为 pred 和 conf
 
         Args:
-            aggregated_tokens_list (List[Tensor]): List of token tensors from different transformer layers.
-            images (Tensor): Input images with shape [B, S, 3, H, W].
-            patch_start_idx (int): Starting index for patch tokens.
-            frames_start_idx (int, optional): Starting index for frames to process.
-            frames_end_idx (int, optional): Ending index for frames to process.
+            aggregated_tokens_list (List[Tensor]): Aggregator 各层 token 列表
+            images (Tensor): 输入图像 [B, S, 3, H, W]
+            patch_start_idx (int): patch tokens 起始索引
+            frames_start_idx (int, optional): 帧块起始索引
+            frames_end_idx (int, optional): 帧块结束索引
 
         Returns:
-            Tensor or Tuple[Tensor, Tensor]: Feature maps or (predictions, confidence).
+            Tensor or Tuple[Tensor, Tensor]: 特征图 或 (predictions, confidence)
         """
         if frames_start_idx is not None and frames_end_idx is not None:
             images = images[:, frames_start_idx:frames_end_idx].contiguous()
@@ -199,33 +229,39 @@ class DPTHead(nn.Module):
 
         patch_h, patch_w = H // self.patch_size, W // self.patch_size
 
+        # 【Step 1: 提取多层特征】
         out = []
         dpt_idx = 0
 
         for layer_idx in self.intermediate_layer_idx:
+            # 取 patch tokens: 跳过 camera 和 register tokens
             x = aggregated_tokens_list[layer_idx][:, :, patch_start_idx:]
 
-            # Select frames if processing a chunk
+            # 如果是分块处理, 只取当前帧块
             if frames_start_idx is not None and frames_end_idx is not None:
                 x = x[:, frames_start_idx:frames_end_idx]
 
+            # [B, S, num_patches, C] -> [B*S, num_patches, C]
             x = x.reshape(B * S, -1, x.shape[-1])
 
             x = self.norm(x)
 
+            # [B*S, num_patches, C] -> [B*S, C, patch_h, patch_w]
             x = x.permute(0, 2, 1).reshape((x.shape[0], x.shape[-1], patch_h, patch_w))
 
+            # 1x1 卷积投影
             x = self.projects[dpt_idx](x)
             if self.pos_embed:
                 x = self._apply_pos_embed(x, W, H)
+            # 上/下采样对齐分辨率
             x = self.resize_layers[dpt_idx](x)
 
             out.append(x)
             dpt_idx += 1
 
-        # Fuse features from multiple layers.
+        # 【Step 2: 特征融合】
         out = self.scratch_forward(out)
-        # Interpolate fused output to match target image resolution.
+        # 插值到目标分辨率
         out = custom_interpolate(
             out,
             (int(patch_h * self.patch_size / self.down_ratio), int(patch_w * self.patch_size / self.down_ratio)),
@@ -239,9 +275,12 @@ class DPTHead(nn.Module):
         if self.feature_only:
             return out.view(B, S, *out.shape[1:])
 
+        # 【Step 3: 输出预测】
         out = self.scratch.output_conv2(out)
+        # activate_head 将 output_dim 通道拆分为: preds (前 output_dim-1 通道) + conf (最后1通道)
         preds, conf = activate_head(out, activation=self.activation, conf_activation=self.conf_activation)
 
+        # 恢复形状: [B*S, C, H, W] -> [B, S, C, H, W]
         preds = preds.view(B, S, *preds.shape[1:])
         conf = conf.view(B, S, *conf.shape[1:])
         return preds, conf
@@ -260,21 +299,30 @@ class DPTHead(nn.Module):
 
     def scratch_forward(self, features: List[torch.Tensor]) -> torch.Tensor:
         """
-        Forward pass through the fusion blocks.
+        【特征融合 - 重点阅读】
+        从深层到浅层逐步融合多尺度特征 (类似 U-Net 的解码器路径)。
+
+        融合顺序 (从高分辨率到低分辨率):
+            refinenet4: layer_4 (最深, 分辨率最低) 上采样到 layer_3 分辨率
+            refinenet3: 融合结果 + layer_3 上采样到 layer_2 分辨率
+            refinenet2: 融合结果 + layer_2 上采样到 layer_1 分辨率
+            refinenet1: 融合结果 + layer_1 (最浅, 分辨率最高)
 
         Args:
-            features (List[Tensor]): List of feature maps from different layers.
+            features (List[Tensor]): 4个尺度的特征图列表
 
         Returns:
-            Tensor: Fused feature map.
+            Tensor: 融合后的特征图
         """
         layer_1, layer_2, layer_3, layer_4 = features
 
+        # 先通过 3x3 卷积统一通道数
         layer_1_rn = self.scratch.layer1_rn(layer_1)
         layer_2_rn = self.scratch.layer2_rn(layer_2)
         layer_3_rn = self.scratch.layer3_rn(layer_3)
         layer_4_rn = self.scratch.layer4_rn(layer_4)
 
+        # 从深层到浅层逐步融合并上采样
         out = self.scratch.refinenet4(layer_4_rn, size=layer_3_rn.shape[2:])
         del layer_4_rn, layer_4
 

@@ -11,16 +11,27 @@ import torch.nn.functional as F
 
 def activate_pose(pred_pose_enc, trans_act="linear", quat_act="linear", fl_act="linear"):
     """
-    Activate pose parameters with specified activation functions.
+    【相机位姿激活函数 - 重点阅读】
+    对 CameraHead 输出的 pose_enc 的各部分应用激活函数。
+
+    pose_enc 结构 (9维):
+        - [:3]:  平移向量 translation
+        - [3:7]: 四元数 quaternion (后续需归一化)
+        - [7:]:  视场角 FoV / 焦距
+
+    默认激活:
+        - trans: linear (无激活)
+        - quat:  linear (无激活, 后续 normalize)
+        - fl:    relu (保证正值, 见 CameraHead 初始化)
 
     Args:
-        pred_pose_enc: Tensor containing encoded pose parameters [translation, quaternion, focal length]
-        trans_act: Activation type for translation component
-        quat_act: Activation type for quaternion component
-        fl_act: Activation type for focal length component
+        pred_pose_enc: 位姿编码 [B, S, 9]
+        trans_act: 平移分量激活类型
+        quat_act:  四元数分量激活类型
+        fl_act:    焦距/FOV 分量激活类型
 
     Returns:
-        Activated pose parameters tensor
+        激活后的位姿编码
     """
     T = pred_pose_enc[..., :3]
     quat = pred_pose_enc[..., 3:7]
@@ -60,15 +71,35 @@ def base_pose_act(pose_enc, act_type="linear"):
 
 def activate_head(out, activation="norm_exp", conf_activation="expp1"):
     """
-    Process network output to extract 3D points and confidence values.
+    【DPTHead 输出激活 - 重点阅读】
+    处理 DPTHead 的网络输出, 拆分为预测值和置信度, 并分别应用激活函数。
+
+    输入: out (B, C, H, W)
+    拆分:
+        - xyz = out[:, :, :, :-1]  (前 C-1 通道): 预测值 (深度或3D坐标)
+        - conf = out[:, :, :, -1]  (最后1通道): 置信度
+
+    深度头 (output_dim=2):
+        - xyz: 1维深度值
+        - 激活: "exp" => torch.exp(xyz), 保证深度为正
+
+    点云头 (output_dim=4):
+        - xyz: 3维世界坐标
+        - 激活: "inv_log" => inverse_log_transform, 允许正负值
+
+    置信度激活 (conf_activation):
+        - "expp1" => 1 + exp(conf), 保证置信度 > 1
+        - "sigmoid" => sigmoid(conf), 范围 [0, 1]
 
     Args:
-        out: Network output tensor (B, C, H, W)
-        activation: Activation type for 3D points
-        conf_activation: Activation type for confidence values
+        out: 网络输出 (B, C, H, W)
+        activation: 预测值激活类型
+        conf_activation: 置信度激活类型
 
     Returns:
-        Tuple of (3D points tensor, confidence tensor)
+        tuple: (pts3d, conf_out)
+            - pts3d (B, H, W, C-1): 激活后的预测值
+            - conf_out (B, H, W): 激活后的置信度
     """
     # Move channels from last dim to the 4th dimension => (B, H, W, C)
     fmap = out.permute(0, 2, 3, 1)  # B,H,W,C expected
@@ -114,12 +145,22 @@ def activate_head(out, activation="norm_exp", conf_activation="expp1"):
 
 def inverse_log_transform(y):
     """
-    Apply inverse log transform: sign(y) * (exp(|y|) - 1)
+    【逆对数变换 - 点云头使用】
+    公式: sign(y) * (exp(|y|) - 1)
+
+    特性:
+        - 可以输出正负值 (适合世界坐标, 中心可能在原点)
+        - 小值时近似线性: 当 y≈0, 输出≈y
+        - 大值时指数增长, 防止梯度消失
+
+    对比 exp 激活:
+        - exp: 只能输出正值 (适合深度值)
+        - inv_log: 可正可负 (适合3D坐标)
 
     Args:
-        y: Input tensor
+        y: 输入张量
 
     Returns:
-        Transformed tensor
+        变换后的张量
     """
     return torch.sign(y) * (torch.expm1(torch.abs(y)))

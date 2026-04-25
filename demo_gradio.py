@@ -43,7 +43,25 @@ model = model.to(device)
 # -------------------------------------------------------------------------
 def run_model(target_dir, model) -> dict:
     """
-    Run the VGGT model on images in the 'target_dir/images' folder and return predictions.
+    【Gradio Demo 核心推理 - 重点阅读】
+    运行 VGGT 模型并整理输出, 供后续可视化使用。
+
+    输出 predictions 字典结构 (全部转为 numpy, 移除 batch 维度):
+        - "pose_enc":        (S, 9)        相机位姿编码
+        - "depth":           (S, H, W, 1)  深度图
+        - "depth_conf":      (S, H, W)     深度置信度
+        - "world_points":    (S, H, W, 3)  点云头直接输出的世界坐标
+        - "world_points_conf": (S, H, W)   点云置信度
+        - "extrinsic":       (S, 3, 4)     相机外参矩阵 (OpenCV camera-from-world)
+        - "intrinsic":       (S, 3, 3)     相机内参矩阵
+        - "images":          (S, H, W, 3)  输入图像
+        - "world_points_from_depth": (S, H, W, 3) 【重点】depth + camera 反投影的点云
+
+    关键处理:
+        1. model(images) 获取原始预测
+        2. pose_encoding_to_extri_intri() 解码相机参数
+        3. unproject_depth_map_to_point_map() 生成更准确的 depth-based 点云
+        4. 所有张量转为 numpy 并移除 batch 维度
     """
     print(f"Processing images from {target_dir}")
 
@@ -72,21 +90,23 @@ def run_model(target_dir, model) -> dict:
 
     with torch.no_grad():
         with torch.cuda.amp.autocast(dtype=dtype):
+            # 【Step 1: 模型推理】
             predictions = model(images)
 
-    # Convert pose encoding to extrinsic and intrinsic matrices
+    # 【Step 2: 解码相机参数】
+    # pose_enc (S, 9) -> extrinsic (S, 3, 4) + intrinsic (S, 3, 3)
     print("Converting pose encoding to extrinsic and intrinsic matrices...")
     extrinsic, intrinsic = pose_encoding_to_extri_intri(predictions["pose_enc"], images.shape[-2:])
     predictions["extrinsic"] = extrinsic
     predictions["intrinsic"] = intrinsic
 
-    # Convert tensors to numpy
+    # 【Step 3: 转换为 numpy 并移除 batch 维度】
     for key in predictions.keys():
         if isinstance(predictions[key], torch.Tensor):
-            predictions[key] = predictions[key].cpu().numpy().squeeze(0)  # remove batch dimension
-    predictions['pose_enc_list'] = None # remove pose_enc_list
+            predictions[key] = predictions[key].cpu().numpy().squeeze(0)
+    predictions['pose_enc_list'] = None  # 清理 pose_enc_list 节省内存
 
-    # Generate world points from depth map
+    # 【Step 4: 生成 depth-based 点云 (通常更准确)】
     print("Computing world points from depth map...")
     depth_map = predictions["depth"]  # (S, H, W, 1)
     world_points = unproject_depth_map_to_point_map(depth_map, predictions["extrinsic"], predictions["intrinsic"])

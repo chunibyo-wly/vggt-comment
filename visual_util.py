@@ -27,28 +27,41 @@ def predictions_to_glb(
     prediction_mode="Predicted Pointmap",
 ) -> trimesh.Scene:
     """
-    Converts VGGT predictions to a 3D scene represented as a GLB file.
+    【可视化输出转换 - 重点阅读】
+    将 VGGT 的预测结果转换为 3D GLB 场景 (用于 Gradio 展示)。
+
+    输入 predictions 字典必须包含:
+        - world_points 或 world_points_from_depth: 3D 点坐标 (S, H, W, 3)
+        - world_points_conf 或 depth_conf: 置信度 (S, H, W)
+        - images: 输入图像 (S, H, W, 3)
+        - extrinsic: 相机外参矩阵 (S, 3, 4)
+
+    两种点云来源:
+        1. "Predicted Pointmap": 使用 point_head 直接输出的 world_points
+        2. "Depth-based": 使用 depth + camera 反投影的 world_points_from_depth
+           【通常更准确, 推荐优先使用】
+
+    处理流程:
+        1. 根据 prediction_mode 选择点云来源
+        2. (可选) 天空分割过滤
+        3. 按置信度阈值过滤低质量点
+        4. (可选) 过滤黑/白背景
+        5. 构建 trimesh 点云和相机可视化
+        6. 返回 trimesh.Scene (可导出为 GLB)
 
     Args:
-        predictions (dict): Dictionary containing model predictions with keys:
-            - world_points: 3D point coordinates (S, H, W, 3)
-            - world_points_conf: Confidence scores (S, H, W)
-            - images: Input images (S, H, W, 3)
-            - extrinsic: Camera extrinsic matrices (S, 3, 4)
-        conf_thres (float): Percentage of low-confidence points to filter out (default: 50.0)
-        filter_by_frames (str): Frame filter specification (default: "all")
-        mask_black_bg (bool): Mask out black background pixels (default: False)
-        mask_white_bg (bool): Mask out white background pixels (default: False)
-        show_cam (bool): Include camera visualization (default: True)
-        mask_sky (bool): Apply sky segmentation mask (default: False)
-        target_dir (str): Output directory for intermediate files (default: None)
-        prediction_mode (str): Prediction mode selector (default: "Predicted Pointmap")
+        predictions (dict): VGGT 预测结果字典
+        conf_thres (float): 置信度过滤百分比 (默认 50.0, 即过滤最低的 50%)
+        filter_by_frames (str): 帧过滤 (默认 "all")
+        mask_black_bg (bool): 是否过滤黑色背景
+        mask_white_bg (bool): 是否过滤白色背景
+        show_cam (bool): 是否显示相机可视化
+        mask_sky (bool): 是否进行天空分割过滤
+        target_dir (str): 中间文件输出目录
+        prediction_mode (str): 点云来源选择 ("Predicted Pointmap" 或 "Depth-based")
 
     Returns:
-        trimesh.Scene: Processed 3D scene containing point cloud and cameras
-
-    Raises:
-        ValueError: If input predictions structure is invalid
+        trimesh.Scene: 包含点云和相机的 3D 场景
     """
     if not isinstance(predictions, dict):
         raise ValueError("predictions must be a dictionary")
@@ -65,10 +78,12 @@ def predictions_to_glb(
         except (ValueError, IndexError):
             pass
 
+    # 【选择点云来源】
     if "Pointmap" in prediction_mode:
         print("Using Pointmap Branch")
         if "world_points" in predictions:
-            pred_world_points = predictions["world_points"]  # No batch dimension to remove
+            # 使用 point_head 直接输出的 world_points
+            pred_world_points = predictions["world_points"]
             pred_world_points_conf = predictions.get("world_points_conf", np.ones_like(pred_world_points[..., 0]))
         else:
             print("Warning: world_points not found in predictions, falling back to depth-based points")
@@ -76,6 +91,7 @@ def predictions_to_glb(
             pred_world_points_conf = predictions.get("depth_conf", np.ones_like(pred_world_points[..., 0]))
     else:
         print("Using Depthmap and Camera Branch")
+        # 【推荐】使用 depth + camera 反投影的点云, 通常更准确
         pred_world_points = predictions["world_points_from_depth"]
         pred_world_points_conf = predictions.get("depth_conf", np.ones_like(pred_world_points[..., 0]))
 
