@@ -63,29 +63,35 @@ def predictions_to_glb(
     Returns:
         trimesh.Scene: 包含点云和相机的 3D 场景
     """
+    # 输入校验: predictions 必须是字典
     if not isinstance(predictions, dict):
         raise ValueError("predictions must be a dictionary")
 
+    # 默认置信度阈值: 10.0 (百分比形式, 过滤掉最低的 10%)
     if conf_thres is None:
         conf_thres = 10.0
 
     print("Building GLB scene")
+
+    # 解析 filter_by_frames 参数, 提取帧索引 (格式如 "0:frame_name")
     selected_frame_idx = None
     if filter_by_frames != "all" and filter_by_frames != "All":
         try:
-            # Extract the index part before the colon
             selected_frame_idx = int(filter_by_frames.split(":")[0])
         except (ValueError, IndexError):
             pass
 
-    # 【选择点云来源】
+    # 【Step 1: 选择点云来源】
+    # prediction_mode 决定使用 point_head 直接输出还是 depth+camera 反投影
     if "Pointmap" in prediction_mode:
         print("Using Pointmap Branch")
         if "world_points" in predictions:
-            # 使用 point_head 直接输出的 world_points
+            # 使用 point_head 直接输出的 world_points (S, H, W, 3)
             pred_world_points = predictions["world_points"]
+            # 置信度: world_points_conf, 若不存在则默认全 1
             pred_world_points_conf = predictions.get("world_points_conf", np.ones_like(pred_world_points[..., 0]))
         else:
+            # 回退到 depth-based 点云
             print("Warning: world_points not found in predictions, falling back to depth-based points")
             pred_world_points = predictions["world_points_from_depth"]
             pred_world_points_conf = predictions.get("depth_conf", np.ones_like(pred_world_points[..., 0]))
@@ -95,11 +101,12 @@ def predictions_to_glb(
         pred_world_points = predictions["world_points_from_depth"]
         pred_world_points_conf = predictions.get("depth_conf", np.ones_like(pred_world_points[..., 0]))
 
-    # Get images from predictions
-    images = predictions["images"]
-    # Use extrinsic matrices instead of pred_extrinsic_list
-    camera_matrices = predictions["extrinsic"]
+    # 从 predictions 提取输入图像和相机外参
+    images = predictions["images"]              # (S, H, W, 3) 或 (S, 3, H, W)
+    camera_matrices = predictions["extrinsic"]  # (S, 3, 4) OpenCV camera-from-world
 
+    # 【Step 2: (可选) 天空分割过滤】
+    # 使用 ONNX 天空分割模型, 将天空区域的置信度置 0
     if mask_sky:
         if target_dir is not None:
             import onnxruntime
@@ -109,122 +116,140 @@ def predictions_to_glb(
             image_list = sorted(os.listdir(target_dir_images))
             sky_mask_list = []
 
-            # Get the shape of pred_world_points_conf to match
+            # 获取与置信度图匹配的 H, W (S 帧, H 高, W 宽)
             S, H, W = (
                 pred_world_points_conf.shape
                 if hasattr(pred_world_points_conf, "shape")
                 else (len(images), images.shape[1], images.shape[2])
             )
 
-            # Download skyseg.onnx if it doesn't exist
+            # 下载天空分割模型 (若不存在)
             if not os.path.exists("skyseg.onnx"):
                 print("Downloading skyseg.onnx...")
                 download_file_from_url(
                     "https://huggingface.co/JianyuanWang/skyseg/resolve/main/skyseg.onnx", "skyseg.onnx"
                 )
 
+            # 逐帧生成/加载天空掩码
             for i, image_name in enumerate(image_list):
                 image_filepath = os.path.join(target_dir_images, image_name)
                 mask_filepath = os.path.join(target_dir, "sky_masks", image_name)
 
-                # Check if mask already exists
                 if os.path.exists(mask_filepath):
-                    # Load existing mask
+                    # 复用已保存的掩码
                     sky_mask = cv2.imread(mask_filepath, cv2.IMREAD_GRAYSCALE)
                 else:
-                    # Generate new mask
+                    # 用 ONNX 模型推理生成掩码
                     if skyseg_session is None:
                         skyseg_session = onnxruntime.InferenceSession("skyseg.onnx")
                     sky_mask = segment_sky(image_filepath, skyseg_session, mask_filepath)
 
-                # Resize mask to match H×W if needed
+                # 若尺寸不匹配, resize 到 HxW
                 if sky_mask.shape[0] != H or sky_mask.shape[1] != W:
                     sky_mask = cv2.resize(sky_mask, (W, H))
 
                 sky_mask_list.append(sky_mask)
 
-            # Convert list to numpy array with shape S×H×W
+            # 将 sky mask list 转为 numpy 数组, 形状 SxHxW
             sky_mask_array = np.array(sky_mask_list)
 
-            # Apply sky mask to confidence scores
+            # 二值化: >0.1 视为非天空区域 (255 保留, 0 过滤)
             sky_mask_binary = (sky_mask_array > 0.1).astype(np.float32)
+            # 将天空区域置信度置 0
             pred_world_points_conf = pred_world_points_conf * sky_mask_binary
 
+    # 【Step 3: (可选) 只保留指定帧】
     if selected_frame_idx is not None:
-        pred_world_points = pred_world_points[selected_frame_idx][None]
-        pred_world_points_conf = pred_world_points_conf[selected_frame_idx][None]
-        images = images[selected_frame_idx][None]
-        camera_matrices = camera_matrices[selected_frame_idx][None]
+        pred_world_points = pred_world_points[selected_frame_idx][None]         # (1, H, W, 3)
+        pred_world_points_conf = pred_world_points_conf[selected_frame_idx][None]  # (1, H, W)
+        images = images[selected_frame_idx][None]                                  # (1, H, W, 3)
+        camera_matrices = camera_matrices[selected_frame_idx][None]                # (1, 3, 4)
 
+    # 【Step 4: 展平点云和颜色】
+    # 将 (S, H, W, 3) 展平为 (S*H*W, 3), 每个像素对应一个 3D 顶点
     vertices_3d = pred_world_points.reshape(-1, 3)
-    # Handle different image formats - check if images need transposing
-    if images.ndim == 4 and images.shape[1] == 3:  # NCHW format
+
+    # 处理图像格式: NCHW (S,3,H,W) -> NHWC (S,H,W,3)
+    if images.ndim == 4 and images.shape[1] == 3:
         colors_rgb = np.transpose(images, (0, 2, 3, 1))
-    else:  # Assume already in NHWC format
+    else:
         colors_rgb = images
+    # 展平颜色并转为 uint8 (0-255)
     colors_rgb = (colors_rgb.reshape(-1, 3) * 255).astype(np.uint8)
 
+    # 【Step 5: 按置信度过滤点云】
+    # 展平置信度: (S, H, W) -> (S*H*W,)
     conf = pred_world_points_conf.reshape(-1)
-    # Convert percentage threshold to actual confidence value
+
+    # 将百分比阈值转换为实际置信度值
+    # 例: conf_thres=50 表示过滤掉置信度最低的 50% 的点
     if conf_thres == 0.0:
         conf_threshold = 0.0
     else:
         conf_threshold = np.percentile(conf, conf_thres)
 
+    # 构建掩码: 保留置信度 >= 阈值 且 > 1e-5 的点
     conf_mask = (conf >= conf_threshold) & (conf > 1e-5)
 
+    # (可选) 过滤黑色背景: RGB 之和 < 16 视为黑色
     if mask_black_bg:
         black_bg_mask = colors_rgb.sum(axis=1) >= 16
         conf_mask = conf_mask & black_bg_mask
 
+    # (可选) 过滤白色背景: RGB 均 > 240 视为白色
     if mask_white_bg:
-        # Filter out white background pixels (RGB values close to white)
-        # Consider pixels white if all RGB values are above 240
         white_bg_mask = ~((colors_rgb[:, 0] > 240) & (colors_rgb[:, 1] > 240) & (colors_rgb[:, 2] > 240))
         conf_mask = conf_mask & white_bg_mask
 
+    # 应用掩码过滤
     vertices_3d = vertices_3d[conf_mask]
     colors_rgb = colors_rgb[conf_mask]
 
+    # 【Step 6: 计算场景尺度】
+    # 用于相机可视化的大小缩放
     if vertices_3d is None or np.asarray(vertices_3d).size == 0:
+        # 若点云为空, 使用默认值避免崩溃
         vertices_3d = np.array([[1, 0, 0]])
         colors_rgb = np.array([[255, 255, 255]])
         scene_scale = 1
     else:
-        # Calculate the 5th and 95th percentiles along each axis
+        # 用 5%-95% 分位点计算包围盒对角线长度作为场景尺度
         lower_percentile = np.percentile(vertices_3d, 5, axis=0)
         upper_percentile = np.percentile(vertices_3d, 95, axis=0)
-
-        # Calculate the diagonal length of the percentile bounding box
         scene_scale = np.linalg.norm(upper_percentile - lower_percentile)
 
+    # 为每帧相机分配不同颜色 (彩虹色映射)
     colormap = matplotlib.colormaps.get_cmap("gist_rainbow")
 
-    # Initialize a 3D scene
+    # 【Step 7: 构建 trimesh 3D 场景】
     scene_3d = trimesh.Scene()
 
-    # Add point cloud data to the scene
+    # 将点云添加到场景
     point_cloud_data = trimesh.PointCloud(vertices=vertices_3d, colors=colors_rgb)
-
     scene_3d.add_geometry(point_cloud_data)
 
-    # Prepare 4x4 matrices for camera extrinsics
+    # 【Step 8: (可选) 添加相机可视化】
+    # 将 (S, 3, 4) 外参补齐为 (S, 4, 4) 齐次矩阵
     num_cameras = len(camera_matrices)
     extrinsics_matrices = np.zeros((num_cameras, 4, 4))
     extrinsics_matrices[:, :3, :4] = camera_matrices
-    extrinsics_matrices[:, 3, 3] = 1
+    extrinsics_matrices[:, 3, 3] = 1  # 齐次坐标最后一行
 
     if show_cam:
-        # Add camera models to the scene
         for i in range(num_cameras):
+            # 外参是世界到相机的变换, 取逆得到相机到世界
             world_to_camera = extrinsics_matrices[i]
             camera_to_world = np.linalg.inv(world_to_camera)
+
+            # 为当前相机分配颜色
             rgba_color = colormap(i / num_cameras)
             current_color = tuple(int(255 * x) for x in rgba_color[:3])
 
+            # 将相机视锥体添加到场景
             integrate_camera_into_scene(scene_3d, camera_to_world, current_color, scene_scale)
 
-    # Align scene to the observation of the first camera
+    # 【Step 9: 场景对齐】
+    # 以第一帧相机为参考, 对齐整个场景到合适的观察角度
     scene_3d = apply_scene_alignment(scene_3d, extrinsics_matrices)
 
     print("GLB Scene built")
