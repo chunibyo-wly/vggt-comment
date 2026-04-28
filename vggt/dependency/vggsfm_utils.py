@@ -52,18 +52,30 @@ def generate_rank_by_dino(
     images, query_frame_num, image_size=336, model_name="dinov2_vitb14_reg", device="cuda", spatial_similarity=False
 ):
     """
-    Generate a ranking of frames using DINO ViT features.
+    【DINO 特征帧排序 - 重点阅读】
+    用 DINOv2 特征计算帧间相似度, 选择最具代表性的 query 帧。
+
+    算法:
+        1. 用 DINOv2 提取每帧的 CLS token 特征
+        2. 计算帧间余弦相似度矩阵
+        3. 找出与其他帧最相似的帧作为起始帧 (most_common_frame)
+        4. 从起始帧出发, 用 Farthest Point Sampling (FPS) 选出 query_frame_num 帧
+           保证选出的帧在特征空间中尽可能分散 (覆盖不同视角)
+
+    为什么用 FPS:
+        - 如果选出的 query 帧太相似, 它们提取的关键点会重复追踪同一区域
+        - FPS 保证 query 帧覆盖不同视角, 提高整体追踪覆盖率
 
     Args:
-        images: Tensor of shape (S, 3, H, W) with values in range [0, 1]
-        query_frame_num: Number of frames to select
-        image_size: Size to resize images to before processing
-        model_name: Name of the DINO model to use
-        device: Device to run the model on
-        spatial_similarity: Whether to use spatial token similarity or CLS token similarity
+        images: 输入图像 (S, 3, H, W), 范围 [0, 1]
+        query_frame_num: 要选多少帧作为 query 帧
+        image_size: DINO 处理分辨率 (默认 336)
+        model_name: DINO 模型名 (默认 dinov2_vitb14_reg)
+        device: 计算设备
+        spatial_similarity: 是否用 patch token 而非 CLS token
 
     Returns:
-        List of frame indices ranked by their representativeness
+        List[int]: 选出的帧索引列表 (按 FPS 顺序)
     """
     # Resize images to the target size
     images = F.interpolate(images, (image_size, image_size), mode="bilinear", align_corners=False)
@@ -117,15 +129,23 @@ def generate_rank_by_dino(
 
 def farthest_point_sampling(distance_matrix, num_samples, most_common_frame_index=0):
     """
-    Farthest point sampling algorithm to select diverse frames.
+    【最远点采样 FPS - 重点阅读】
+    从帧集合中选出特征差异最大的帧, 保证视角多样性。
+
+    算法步骤:
+        1. 从 most_common_frame (与其他帧最相似的帧) 开始
+        2. 每轮选择距离当前已选集合最远的帧
+        3. 直到选出 num_samples 个帧
+
+    等价于在特征空间均匀采样, 避免选出的 query 帧扎堆在同一视角。
 
     Args:
-        distance_matrix: Matrix of distances between frames
-        num_samples: Number of frames to select
-        most_common_frame_index: Index of the first frame to select
+        distance_matrix: 帧间距离矩阵 (S, S)
+        num_samples: 要选出的帧数
+        most_common_frame_index: 起始帧索引
 
     Returns:
-        List of selected frame indices
+        List[int]: 选出的帧索引列表
     """
     distance_matrix = distance_matrix.clamp(min=0)
     N = distance_matrix.size(0)
@@ -152,18 +172,26 @@ def farthest_point_sampling(distance_matrix, num_samples, most_common_frame_inde
 
 def calculate_index_mappings(query_index, S, device=None):
     """
-    Construct an order that switches [query_index] and [0]
-    so that the content of query_index would be placed at [0].
+    【帧顺序重排 - 重点阅读】
+    构造索引映射, 将 query_index 位置的元素换到第 0 位。
+
+    tracker 内部假设第 0 帧是 query 帧, 所以需要将当前 query 帧
+    通过索引重排移到第 0 位, 追踪完后再 swap 回来。
+
+    例: query_index=3, S=5
+        原始顺序: [0, 1, 2, 3, 4]
+        重排后:   [3, 1, 2, 0, 4]
 
     Args:
-        query_index: Index to swap with 0
-        S: Total number of elements
-        device: Device to place the tensor on
+        query_index: 要移到第 0 位的帧索引
+        S: 总帧数
+        device: 计算设备
 
     Returns:
-        Tensor of indices with the swapped order
+        Tensor: 重排后的索引顺序 (S,)
     """
     new_order = torch.arange(S)
+    # 将 query_index 和 0 互换位置
     new_order[0] = query_index
     new_order[query_index] = 0
     if device is not None:
@@ -188,16 +216,28 @@ def switch_tensor_order(tensors, order, dim=1):
 
 def initialize_feature_extractors(max_query_num, det_thres=0.005, extractor_method="aliked", device="cuda"):
     """
-    Initialize feature extractors that can be reused based on a method string.
+    【初始化关键点提取器 - 重点阅读】
+    根据方法字符串初始化一个或多个特征点提取器。
+
+    支持的方法 (用 '+' 组合):
+        - "aliked":  ALIKED 提取器, 速度快, 适合纹理丰富区域
+        - "sp":      SuperPoint, 深度学习检测器, 泛化性好
+        - "sift":    SIFT, 传统方法, 对尺度/旋转鲁棒
+
+    组合示例:
+        - "aliked+sp":      先用 ALIKED 再用 SuperPoint 补充 (默认)
+        - "sp+sift+aliked": 三种都用, 提取最多特征点 (最终尝试模式用)
+
+    输出字典结构: {"aliked": ALIKED_model, "sp": SuperPoint_model, ...}
 
     Args:
-        max_query_num: Maximum number of keypoints to extract
-        det_thres: Detection threshold for keypoint extraction
-        extractor_method: String specifying which extractors to use (e.g., "aliked", "sp+sift", "aliked+sp+sift")
-        device: Device to run extraction on
+        max_query_num: 每帧最多提取多少关键点
+        det_thres: 检测阈值 (越低关键点越多)
+        extractor_method: 提取器方法字符串 (如 "aliked+sp")
+        device: 计算设备
 
     Returns:
-        Dictionary of initialized extractors
+        Dict: 提取器名称到模型实例的字典
     """
     extractors = {}
     methods = extractor_method.lower().split("+")
@@ -226,14 +266,24 @@ def initialize_feature_extractors(max_query_num, det_thres=0.005, extractor_meth
 
 def extract_keypoints(query_image, extractors, round_keypoints=True):
     """
-    Extract keypoints using pre-initialized feature extractors.
+    【关键点提取 - 重点阅读】
+    用预初始化的提取器在 query 帧上提取关键点坐标。
+
+    处理流程:
+        1. 遍历所有提取器 (如 ALIKED, SuperPoint)
+        2. 每个提取器输出关键点坐标 (1, N_i, 2)
+        3. 将所有提取器的结果沿 N 维度拼接
+        4. 返回合并后的关键点 (1, N_total, 2)
+
+    坐标格式: (x, y), 其中 x 是列坐标, y 是行坐标, 与 OpenCV 一致。
 
     Args:
-        query_image: Input image tensor (3xHxW, range [0, 1])
-        extractors: Dictionary of initialized extractors
+        query_image: 输入图像 (3, H, W), 范围 [0, 1]
+        extractors: 提取器字典 (来自 initialize_feature_extractors)
+        round_keypoints: 是否将坐标 round 到整数
 
     Returns:
-        Tensor of keypoint coordinates (1xNx2)
+        Tensor: 关键点坐标 (1, N, 2)
     """
     query_points = None
 
@@ -256,18 +306,34 @@ def predict_tracks_in_chunks(
     track_predictor, images_feed, query_points_list, fmaps_feed, fine_tracking, num_splits=None, fine_chunk=40960
 ):
     """
-    Process a list of query points to avoid memory issues.
+    【分块追踪 - 重点阅读】
+    将大量 query 点拆分成多个 chunk 逐个追踪, 防止 GPU OOM。
+
+    原理:
+        tracker 的计算量与 (帧数 × 关键点数) 成正比。
+        当总点数 all_points_num = S × N 超过 max_points_num 时,
+        将 query_points 沿 N 维度拆成多个 chunk, 分别送入 tracker,
+        最后将结果拼接。
+
+    输入/输出维度:
+        - images_feed:    (1, S, 3, H, W)
+        - query_points:   list of (1, N_i, 2), sum(N_i) = N
+        - fmaps_feed:     (1, S, C, H, W)
+        - pred_track:     (1, S, N, 2)
+        - pred_vis:       (1, S, N)
+        - pred_score:     (1, S, N)
 
     Args:
-        track_predictor (object): The track predictor object used for predicting tracks.
-        images_feed (torch.Tensor): A tensor of shape (B, T, C, H, W) representing a batch of images.
-        query_points_list (list or tuple): A list/tuple of tensors, each of shape (B, Ni, 2) representing chunks of query points.
-        fmaps_feed (torch.Tensor): A tensor of feature maps for the tracker.
-        fine_tracking (bool): Whether to perform fine tracking.
-        num_splits (int, optional): Ignored when query_points_list is provided. Kept for backward compatibility.
+        track_predictor: TrackerPredictor 实例
+        images_feed: 图像张量 (1, S, 3, H, W)
+        query_points_list: query 点分块列表, 每个元素 (1, N_i, 2)
+        fmaps_feed: 特征图 (1, S, C, H, W)
+        fine_tracking: 是否精细追踪
+        num_splits: (兼容旧版) 分割数
+        fine_chunk: 精细追踪的 chunk 大小
 
     Returns:
-        tuple: A tuple containing the concatenated predicted tracks, visibility, and scores.
+        tuple: (pred_track, pred_vis, pred_score)
     """
     # If query_points_list is not a list or tuple but a single tensor, handle it like the old version for backward compatibility
     if not isinstance(query_points_list, (list, tuple)):
