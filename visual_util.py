@@ -15,6 +15,181 @@ import os
 import requests
 
 
+def _get_filtered_pointcloud(
+    predictions,
+    conf_thres=50.0,
+    filter_by_frames="all",
+    mask_black_bg=False,
+    mask_white_bg=False,
+    mask_sky=False,
+    target_dir=None,
+    prediction_mode="Predicted Pointmap",
+):
+    """
+    【过滤后的点云提取 - 内部辅助函数】
+    从 VGGT 预测结果中提取经过过滤的点云顶点和颜色。
+
+    返回:
+        vertices_3d: (N, 3) 过滤后的 3D 点坐标
+        colors_rgb:  (N, 3) 对应的 RGB 颜色 (uint8)
+    """
+    if not isinstance(predictions, dict):
+        raise ValueError("predictions must be a dictionary")
+
+    if conf_thres is None:
+        conf_thres = 10.0
+
+    selected_frame_idx = None
+    if filter_by_frames != "all" and filter_by_frames != "All":
+        try:
+            selected_frame_idx = int(filter_by_frames.split(":")[0])
+        except (ValueError, IndexError):
+            pass
+
+    # 选择点云来源
+    if "Pointmap" in prediction_mode:
+        if "world_points" in predictions:
+            pred_world_points = predictions["world_points"]
+            pred_world_points_conf = predictions.get("world_points_conf", np.ones_like(pred_world_points[..., 0]))
+        else:
+            pred_world_points = predictions["world_points_from_depth"]
+            pred_world_points_conf = predictions.get("depth_conf", np.ones_like(pred_world_points[..., 0]))
+    else:
+        pred_world_points = predictions["world_points_from_depth"]
+        pred_world_points_conf = predictions.get("depth_conf", np.ones_like(pred_world_points[..., 0]))
+
+    images = predictions["images"]
+
+    # 天空分割过滤
+    if mask_sky and target_dir is not None:
+        import onnxruntime
+
+        skyseg_session = None
+        target_dir_images = target_dir + "/images"
+        image_list = sorted(os.listdir(target_dir_images))
+        sky_mask_list = []
+
+        S, H, W = (
+            pred_world_points_conf.shape
+            if hasattr(pred_world_points_conf, "shape")
+            else (len(images), images.shape[1], images.shape[2])
+        )
+
+        if not os.path.exists("skyseg.onnx"):
+            print("Downloading skyseg.onnx...")
+            download_file_from_url(
+                "https://huggingface.co/JianyuanWang/skyseg/resolve/main/skyseg.onnx", "skyseg.onnx"
+            )
+
+        for i, image_name in enumerate(image_list):
+            image_filepath = os.path.join(target_dir_images, image_name)
+            mask_filepath = os.path.join(target_dir, "sky_masks", image_name)
+
+            if os.path.exists(mask_filepath):
+                sky_mask = cv2.imread(mask_filepath, cv2.IMREAD_GRAYSCALE)
+            else:
+                if skyseg_session is None:
+                    skyseg_session = onnxruntime.InferenceSession("skyseg.onnx")
+                sky_mask = segment_sky(image_filepath, skyseg_session, mask_filepath)
+
+            if sky_mask.shape[0] != H or sky_mask.shape[1] != W:
+                sky_mask = cv2.resize(sky_mask, (W, H))
+
+            sky_mask_list.append(sky_mask)
+
+        sky_mask_array = np.array(sky_mask_list)
+        sky_mask_binary = (sky_mask_array > 0.1).astype(np.float32)
+        pred_world_points_conf = pred_world_points_conf * sky_mask_binary
+
+    # 只保留指定帧
+    if selected_frame_idx is not None:
+        pred_world_points = pred_world_points[selected_frame_idx][None]
+        pred_world_points_conf = pred_world_points_conf[selected_frame_idx][None]
+        images = images[selected_frame_idx][None]
+
+    # 展平点云和颜色
+    vertices_3d = pred_world_points.reshape(-1, 3)
+
+    if images.ndim == 4 and images.shape[1] == 3:
+        colors_rgb = np.transpose(images, (0, 2, 3, 1))
+    else:
+        colors_rgb = images
+    colors_rgb = (colors_rgb.reshape(-1, 3) * 255).astype(np.uint8)
+
+    # 按置信度过滤
+    conf = pred_world_points_conf.reshape(-1)
+
+    if conf_thres == 0.0:
+        conf_threshold = 0.0
+    else:
+        conf_threshold = np.percentile(conf, conf_thres)
+
+    conf_mask = (conf >= conf_threshold) & (conf > 1e-5)
+
+    if mask_black_bg:
+        black_bg_mask = colors_rgb.sum(axis=1) >= 16
+        conf_mask = conf_mask & black_bg_mask
+
+    if mask_white_bg:
+        white_bg_mask = ~((colors_rgb[:, 0] > 240) & (colors_rgb[:, 1] > 240) & (colors_rgb[:, 2] > 240))
+        conf_mask = conf_mask & white_bg_mask
+
+    vertices_3d = vertices_3d[conf_mask]
+    colors_rgb = colors_rgb[conf_mask]
+
+    # 空点云保护
+    if vertices_3d is None or np.asarray(vertices_3d).size == 0:
+        vertices_3d = np.array([[1, 0, 0]])
+        colors_rgb = np.array([[255, 255, 255]])
+
+    return vertices_3d, colors_rgb
+
+
+def predictions_to_ply(
+    predictions,
+    conf_thres=50.0,
+    filter_by_frames="all",
+    mask_black_bg=False,
+    mask_white_bg=False,
+    mask_sky=False,
+    target_dir=None,
+    prediction_mode="Predicted Pointmap",
+) -> trimesh.PointCloud:
+    """
+    【PLY 点云导出 - 不含相机】
+    将 VGGT 预测结果转换为纯点云 (trimesh.PointCloud)，用于导出 PLY 格式。
+
+    与 predictions_to_glb 的区别:
+        - 只返回点云，不添加相机模型
+        - 不做场景对齐 (保留原始世界坐标系)
+        - 可直接调用 .export("xxx.ply") 保存
+
+    Args:
+        predictions (dict): VGGT 预测结果字典
+        conf_thres (float): 置信度过滤百分比
+        filter_by_frames (str): 帧过滤
+        mask_black_bg (bool): 是否过滤黑色背景
+        mask_white_bg (bool): 是否过滤白色背景
+        mask_sky (bool): 是否进行天空分割过滤
+        target_dir (str): 中间文件输出目录
+        prediction_mode (str): 点云来源选择
+
+    Returns:
+        trimesh.PointCloud: 过滤后的点云对象
+    """
+    vertices_3d, colors_rgb = _get_filtered_pointcloud(
+        predictions,
+        conf_thres=conf_thres,
+        filter_by_frames=filter_by_frames,
+        mask_black_bg=mask_black_bg,
+        mask_white_bg=mask_white_bg,
+        mask_sky=mask_sky,
+        target_dir=target_dir,
+        prediction_mode=prediction_mode,
+    )
+    return trimesh.PointCloud(vertices=vertices_3d, colors=colors_rgb)
+
+
 def predictions_to_glb(
     predictions,
     conf_thres=50.0,
@@ -63,157 +238,24 @@ def predictions_to_glb(
     Returns:
         trimesh.Scene: 包含点云和相机的 3D 场景
     """
-    # 输入校验: predictions 必须是字典
-    if not isinstance(predictions, dict):
-        raise ValueError("predictions must be a dictionary")
-
-    # 默认置信度阈值: 10.0 (百分比形式, 过滤掉最低的 10%)
-    if conf_thres is None:
-        conf_thres = 10.0
-
     print("Building GLB scene")
 
-    # 解析 filter_by_frames 参数, 提取帧索引 (格式如 "0:frame_name")
-    selected_frame_idx = None
-    if filter_by_frames != "all" and filter_by_frames != "All":
-        try:
-            selected_frame_idx = int(filter_by_frames.split(":")[0])
-        except (ValueError, IndexError):
-            pass
+    camera_matrices = predictions["extrinsic"]
+    vertices_3d, colors_rgb = _get_filtered_pointcloud(
+        predictions,
+        conf_thres=conf_thres,
+        filter_by_frames=filter_by_frames,
+        mask_black_bg=mask_black_bg,
+        mask_white_bg=mask_white_bg,
+        mask_sky=mask_sky,
+        target_dir=target_dir,
+        prediction_mode=prediction_mode,
+    )
 
-    # 【Step 1: 选择点云来源】
-    # prediction_mode 决定使用 point_head 直接输出还是 depth+camera 反投影
-    if "Pointmap" in prediction_mode:
-        print("Using Pointmap Branch")
-        if "world_points" in predictions:
-            # 使用 point_head 直接输出的 world_points (S, H, W, 3)
-            pred_world_points = predictions["world_points"]
-            # 置信度: world_points_conf, 若不存在则默认全 1
-            pred_world_points_conf = predictions.get("world_points_conf", np.ones_like(pred_world_points[..., 0]))
-        else:
-            # 回退到 depth-based 点云
-            print("Warning: world_points not found in predictions, falling back to depth-based points")
-            pred_world_points = predictions["world_points_from_depth"]
-            pred_world_points_conf = predictions.get("depth_conf", np.ones_like(pred_world_points[..., 0]))
-    else:
-        print("Using Depthmap and Camera Branch")
-        # 【推荐】使用 depth + camera 反投影的点云, 通常更准确
-        pred_world_points = predictions["world_points_from_depth"]
-        pred_world_points_conf = predictions.get("depth_conf", np.ones_like(pred_world_points[..., 0]))
-
-    # 从 predictions 提取输入图像和相机外参
-    images = predictions["images"]              # (S, H, W, 3) 或 (S, 3, H, W)
-    camera_matrices = predictions["extrinsic"]  # (S, 3, 4) OpenCV camera-from-world
-
-    # 【Step 2: (可选) 天空分割过滤】
-    # 使用 ONNX 天空分割模型, 将天空区域的置信度置 0
-    if mask_sky:
-        if target_dir is not None:
-            import onnxruntime
-
-            skyseg_session = None
-            target_dir_images = target_dir + "/images"
-            image_list = sorted(os.listdir(target_dir_images))
-            sky_mask_list = []
-
-            # 获取与置信度图匹配的 H, W (S 帧, H 高, W 宽)
-            S, H, W = (
-                pred_world_points_conf.shape
-                if hasattr(pred_world_points_conf, "shape")
-                else (len(images), images.shape[1], images.shape[2])
-            )
-
-            # 下载天空分割模型 (若不存在)
-            if not os.path.exists("skyseg.onnx"):
-                print("Downloading skyseg.onnx...")
-                download_file_from_url(
-                    "https://huggingface.co/JianyuanWang/skyseg/resolve/main/skyseg.onnx", "skyseg.onnx"
-                )
-
-            # 逐帧生成/加载天空掩码
-            for i, image_name in enumerate(image_list):
-                image_filepath = os.path.join(target_dir_images, image_name)
-                mask_filepath = os.path.join(target_dir, "sky_masks", image_name)
-
-                if os.path.exists(mask_filepath):
-                    # 复用已保存的掩码
-                    sky_mask = cv2.imread(mask_filepath, cv2.IMREAD_GRAYSCALE)
-                else:
-                    # 用 ONNX 模型推理生成掩码
-                    if skyseg_session is None:
-                        skyseg_session = onnxruntime.InferenceSession("skyseg.onnx")
-                    sky_mask = segment_sky(image_filepath, skyseg_session, mask_filepath)
-
-                # 若尺寸不匹配, resize 到 HxW
-                if sky_mask.shape[0] != H or sky_mask.shape[1] != W:
-                    sky_mask = cv2.resize(sky_mask, (W, H))
-
-                sky_mask_list.append(sky_mask)
-
-            # 将 sky mask list 转为 numpy 数组, 形状 SxHxW
-            sky_mask_array = np.array(sky_mask_list)
-
-            # 二值化: >0.1 视为非天空区域 (255 保留, 0 过滤)
-            sky_mask_binary = (sky_mask_array > 0.1).astype(np.float32)
-            # 将天空区域置信度置 0
-            pred_world_points_conf = pred_world_points_conf * sky_mask_binary
-
-    # 【Step 3: (可选) 只保留指定帧】
-    if selected_frame_idx is not None:
-        pred_world_points = pred_world_points[selected_frame_idx][None]         # (1, H, W, 3)
-        pred_world_points_conf = pred_world_points_conf[selected_frame_idx][None]  # (1, H, W)
-        images = images[selected_frame_idx][None]                                  # (1, H, W, 3)
-        camera_matrices = camera_matrices[selected_frame_idx][None]                # (1, 3, 4)
-
-    # 【Step 4: 展平点云和颜色】
-    # 将 (S, H, W, 3) 展平为 (S*H*W, 3), 每个像素对应一个 3D 顶点
-    vertices_3d = pred_world_points.reshape(-1, 3)
-
-    # 处理图像格式: NCHW (S,3,H,W) -> NHWC (S,H,W,3)
-    if images.ndim == 4 and images.shape[1] == 3:
-        colors_rgb = np.transpose(images, (0, 2, 3, 1))
-    else:
-        colors_rgb = images
-    # 展平颜色并转为 uint8 (0-255)
-    colors_rgb = (colors_rgb.reshape(-1, 3) * 255).astype(np.uint8)
-
-    # 【Step 5: 按置信度过滤点云】
-    # 展平置信度: (S, H, W) -> (S*H*W,)
-    conf = pred_world_points_conf.reshape(-1)
-
-    # 将百分比阈值转换为实际置信度值
-    # 例: conf_thres=50 表示过滤掉置信度最低的 50% 的点
-    if conf_thres == 0.0:
-        conf_threshold = 0.0
-    else:
-        conf_threshold = np.percentile(conf, conf_thres)
-
-    # 构建掩码: 保留置信度 >= 阈值 且 > 1e-5 的点
-    conf_mask = (conf >= conf_threshold) & (conf > 1e-5)
-
-    # (可选) 过滤黑色背景: RGB 之和 < 16 视为黑色
-    if mask_black_bg:
-        black_bg_mask = colors_rgb.sum(axis=1) >= 16
-        conf_mask = conf_mask & black_bg_mask
-
-    # (可选) 过滤白色背景: RGB 均 > 240 视为白色
-    if mask_white_bg:
-        white_bg_mask = ~((colors_rgb[:, 0] > 240) & (colors_rgb[:, 1] > 240) & (colors_rgb[:, 2] > 240))
-        conf_mask = conf_mask & white_bg_mask
-
-    # 应用掩码过滤
-    vertices_3d = vertices_3d[conf_mask]
-    colors_rgb = colors_rgb[conf_mask]
-
-    # 【Step 6: 计算场景尺度】
-    # 用于相机可视化的大小缩放
+    # 计算场景尺度 (用于相机可视化大小)
     if vertices_3d is None or np.asarray(vertices_3d).size == 0:
-        # 若点云为空, 使用默认值避免崩溃
-        vertices_3d = np.array([[1, 0, 0]])
-        colors_rgb = np.array([[255, 255, 255]])
         scene_scale = 1
     else:
-        # 用 5%-95% 分位点计算包围盒对角线长度作为场景尺度
         lower_percentile = np.percentile(vertices_3d, 5, axis=0)
         upper_percentile = np.percentile(vertices_3d, 95, axis=0)
         scene_scale = np.linalg.norm(upper_percentile - lower_percentile)

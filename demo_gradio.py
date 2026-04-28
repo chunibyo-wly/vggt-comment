@@ -18,7 +18,7 @@ import time
 
 sys.path.append("vggt/")
 
-from visual_util import predictions_to_glb
+from visual_util import predictions_to_glb, predictions_to_ply
 from vggt.models.vggt import VGGT
 from vggt.utils.load_fn import load_and_preprocess_images
 from vggt.utils.pose_enc import pose_encoding_to_extri_intri
@@ -241,11 +241,10 @@ def gradio_demo(
     if frame_filter is None:
         frame_filter = "All"
 
-    # Build a GLB file name
-    glbfile = os.path.join(
-        target_dir,
-        f"glbscene_{conf_thres}_{frame_filter.replace('.', '_').replace(':', '').replace(' ', '_')}_maskb{mask_black_bg}_maskw{mask_white_bg}_cam{show_cam}_sky{mask_sky}_pred{prediction_mode.replace(' ', '_')}.glb",
-    )
+    # Build file names
+    base_name = f"{conf_thres}_{frame_filter.replace('.', '_').replace(':', '').replace(' ', '_')}_maskb{mask_black_bg}_maskw{mask_white_bg}_cam{show_cam}_sky{mask_sky}_pred{prediction_mode.replace(' ', '_')}"
+    glbfile = os.path.join(target_dir, f"glbscene_{base_name}.glb")
+    plyfile = os.path.join(target_dir, f"pointcloud_{base_name}.ply")
 
     # Convert predictions to GLB
     glbscene = predictions_to_glb(
@@ -261,6 +260,19 @@ def gradio_demo(
     )
     glbscene.export(file_obj=glbfile)
 
+    # Convert predictions to PLY (point cloud only, no cameras)
+    point_cloud = predictions_to_ply(
+        predictions,
+        conf_thres=conf_thres,
+        filter_by_frames=frame_filter,
+        mask_black_bg=mask_black_bg,
+        mask_white_bg=mask_white_bg,
+        mask_sky=mask_sky,
+        target_dir=target_dir,
+        prediction_mode=prediction_mode,
+    )
+    point_cloud.export(file_obj=plyfile)
+
     # Cleanup
     del predictions
     gc.collect()
@@ -270,7 +282,7 @@ def gradio_demo(
     print(f"Total time: {end_time - start_time:.2f} seconds (including IO)")
     log_msg = f"Reconstruction Success ({len(all_files)} frames). Waiting for visualization."
 
-    return glbfile, log_msg, gr.Dropdown(choices=frame_filter_choices, value=frame_filter, interactive=True)
+    return glbfile, plyfile, log_msg, gr.Dropdown(choices=frame_filter_choices, value=frame_filter, interactive=True)
 
 
 # -------------------------------------------------------------------------
@@ -324,10 +336,9 @@ def update_visualization(
     loaded = np.load(predictions_path)
     predictions = {key: np.array(loaded[key]) for key in key_list}
 
-    glbfile = os.path.join(
-        target_dir,
-        f"glbscene_{conf_thres}_{frame_filter.replace('.', '_').replace(':', '').replace(' ', '_')}_maskb{mask_black_bg}_maskw{mask_white_bg}_cam{show_cam}_sky{mask_sky}_pred{prediction_mode.replace(' ', '_')}.glb",
-    )
+    base_name = f"{conf_thres}_{frame_filter.replace('.', '_').replace(':', '').replace(' ', '_')}_maskb{mask_black_bg}_maskw{mask_white_bg}_cam{show_cam}_sky{mask_sky}_pred{prediction_mode.replace(' ', '_')}"
+    glbfile = os.path.join(target_dir, f"glbscene_{base_name}.glb")
+    plyfile = os.path.join(target_dir, f"pointcloud_{base_name}.ply")
 
     if not os.path.exists(glbfile):
         glbscene = predictions_to_glb(
@@ -343,7 +354,20 @@ def update_visualization(
         )
         glbscene.export(file_obj=glbfile)
 
-    return glbfile, "Updating Visualization"
+    if not os.path.exists(plyfile):
+        point_cloud = predictions_to_ply(
+            predictions,
+            conf_thres=conf_thres,
+            filter_by_frames=frame_filter,
+            mask_black_bg=mask_black_bg,
+            mask_white_bg=mask_white_bg,
+            mask_sky=mask_sky,
+            target_dir=target_dir,
+            prediction_mode=prediction_mode,
+        )
+        point_cloud.export(file_obj=plyfile)
+
+    return glbfile, plyfile, "Updating Visualization"
 
 
 # -------------------------------------------------------------------------
@@ -478,9 +502,12 @@ with gr.Blocks(
             with gr.Row():
                 submit_btn = gr.Button("Reconstruct", scale=1, variant="primary")
                 clear_btn = gr.ClearButton(
-                    [input_video, input_images, reconstruction_output, log_output, target_dir_output, image_gallery],
+                    [input_video, input_images, reconstruction_output, ply_download, log_output, target_dir_output, image_gallery],
                     scale=1,
                 )
+
+            with gr.Row():
+                ply_download = gr.File(label="Download Point Cloud (PLY)", interactive=False)
 
             with gr.Row():
                 prediction_mode = gr.Radio(
@@ -532,10 +559,10 @@ with gr.Blocks(
         target_dir, image_paths = handle_uploads(input_video, input_images)
         # Always use "All" for frame_filter in examples
         frame_filter = "All"
-        glbfile, log_msg, dropdown = gradio_demo(
+        glbfile, plyfile, log_msg, dropdown = gradio_demo(
             target_dir, conf_thres, frame_filter, mask_black_bg, mask_white_bg, show_cam, mask_sky, prediction_mode
         )
-        return glbfile, log_msg, target_dir, dropdown, image_paths
+        return glbfile, plyfile, log_msg, target_dir, dropdown, image_paths
 
     gr.Markdown("Click any row to load an example.", elem_classes=["example-log"])
 
@@ -553,7 +580,7 @@ with gr.Blocks(
             prediction_mode,
             is_example,
         ],
-        outputs=[reconstruction_output, log_output, target_dir_output, frame_filter, image_gallery],
+        outputs=[reconstruction_output, ply_download, log_output, target_dir_output, frame_filter, image_gallery],
         fn=example_pipeline,
         cache_examples=False,
         examples_per_page=50,
@@ -580,7 +607,7 @@ with gr.Blocks(
             mask_sky,
             prediction_mode,
         ],
-        outputs=[reconstruction_output, log_output, frame_filter],
+        outputs=[reconstruction_output, ply_download, log_output, frame_filter],
     ).then(
         fn=lambda: "False", inputs=[], outputs=[is_example]  # set is_example to "False"
     )
@@ -601,7 +628,7 @@ with gr.Blocks(
             prediction_mode,
             is_example,
         ],
-        [reconstruction_output, log_output],
+        [reconstruction_output, ply_download, log_output],
     )
     frame_filter.change(
         update_visualization,
@@ -616,7 +643,7 @@ with gr.Blocks(
             prediction_mode,
             is_example,
         ],
-        [reconstruction_output, log_output],
+        [reconstruction_output, ply_download, log_output],
     )
     mask_black_bg.change(
         update_visualization,
@@ -631,7 +658,7 @@ with gr.Blocks(
             prediction_mode,
             is_example,
         ],
-        [reconstruction_output, log_output],
+        [reconstruction_output, ply_download, log_output],
     )
     mask_white_bg.change(
         update_visualization,
@@ -646,7 +673,7 @@ with gr.Blocks(
             prediction_mode,
             is_example,
         ],
-        [reconstruction_output, log_output],
+        [reconstruction_output, ply_download, log_output],
     )
     show_cam.change(
         update_visualization,
@@ -661,7 +688,7 @@ with gr.Blocks(
             prediction_mode,
             is_example,
         ],
-        [reconstruction_output, log_output],
+        [reconstruction_output, ply_download, log_output],
     )
     mask_sky.change(
         update_visualization,
@@ -676,7 +703,7 @@ with gr.Blocks(
             prediction_mode,
             is_example,
         ],
-        [reconstruction_output, log_output],
+        [reconstruction_output, ply_download, log_output],
     )
     prediction_mode.change(
         update_visualization,
@@ -691,7 +718,7 @@ with gr.Blocks(
             prediction_mode,
             is_example,
         ],
-        [reconstruction_output, log_output],
+        [reconstruction_output, ply_download, log_output],
     )
 
     # -------------------------------------------------------------------------
