@@ -312,14 +312,14 @@ def update_visualization(
 
     # If it's an example click, skip as requested
     if is_example == "True":
-        return None, "No reconstruction available. Please click the Reconstruct button first."
+        return None, None, "No reconstruction available. Please click the Reconstruct button first."
 
     if not target_dir or target_dir == "None" or not os.path.isdir(target_dir):
-        return None, "No reconstruction available. Please click the Reconstruct button first."
+        return None, None, "No reconstruction available. Please click the Reconstruct button first."
 
     predictions_path = os.path.join(target_dir, "predictions.npz")
     if not os.path.exists(predictions_path):
-        return None, f"No reconstruction available at {predictions_path}. Please run 'Reconstruct' first."
+        return None, None, f"No reconstruction available at {predictions_path}. Please run 'Reconstruct' first."
 
     key_list = [
         "pose_enc",
@@ -500,14 +500,14 @@ with gr.Blocks(
                 reconstruction_output = gr.Model3D(height=520, zoom_speed=0.5, pan_speed=0.5)
 
             with gr.Row():
+                ply_download = gr.File(label="Download Point Cloud (PLY)", interactive=False)
+
+            with gr.Row():
                 submit_btn = gr.Button("Reconstruct", scale=1, variant="primary")
                 clear_btn = gr.ClearButton(
                     [input_video, input_images, reconstruction_output, ply_download, log_output, target_dir_output, image_gallery],
                     scale=1,
                 )
-
-            with gr.Row():
-                ply_download = gr.File(label="Download Point Cloud (PLY)", interactive=False)
 
             with gr.Row():
                 prediction_mode = gr.Radio(
