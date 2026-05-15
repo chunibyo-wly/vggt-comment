@@ -102,30 +102,118 @@ def compute_relative_transform(T_A, T_B):
     return T_AB, rot_angle, trans_mag
 
 
-def visualize_consistency(shared_names, rot_angles, trans_mags, cluster_a_name, cluster_b_name, output_dir):
-    """可视化两个 cluster 的 pose 一致性。"""
+def align_scale(results):
+    """
+    对旋转一致的共享图片进行尺度统一。
+
+    输入:
+        results: list of dict, 每个元素包含 'T_AB' (3,4)
+
+    输出:
+        T_AB_unified: (3, 4) 统一后的相对变换 [R_AB | t_AB_unified]
+    """
+    # ---- Step 1: 统一旋转 ----
+    rotations = Rotation.from_matrix(np.stack([r["T_AB"][:, :3] for r in results]))
+    R_AB_unified = rotations.mean().as_matrix()
+
+    # ---- Step 2: 统一平移（尺度对齐）----
+    t_ABs = np.stack([r["T_AB"][:, 3] for r in results])  # (N, 3)
+
+    # 计算平均方向
+    norms = np.linalg.norm(t_ABs, axis=1, keepdims=True) + 1e-8
+    directions = t_ABs / norms
+    d = np.mean(directions, axis=0)
+    d = d / (np.linalg.norm(d) + 1e-8)
+
+    # 标量投影
+    projections = t_ABs @ d  # (N,)
+    s = np.median(projections)
+
+    t_AB_unified = s * d
+
+    T_AB_unified = np.hstack([R_AB_unified, t_AB_unified[:, None]])
+    return T_AB_unified
+
+
+def evaluate_with_aligned_pose(poses_A, poses_B, shared, T_AB_unified):
+    """
+    用统一后的 T_AB 将 cluster B 的 pose 转换到 cluster A 坐标系，重新评估一致性。
+
+    流程:
+        T_B_in_A = T_B * inv(T_AB_unified)
+        然后比较 T_A 和 T_B_in_A 的差异
+
+    Returns:
+        aligned_rot_angles: (N,) 对齐后的旋转误差 (度)
+        aligned_trans_mags: (N,) 对齐后的平移误差
+    """
+    R_AB = T_AB_unified[:, :3]
+    t_AB = T_AB_unified[:, 3]
+
+    # inv(T_AB) = [R_AB^T | -R_AB^T * t_AB]
+    R_AB_inv = R_AB.T
+    t_AB_inv = -R_AB_inv @ t_AB
+
+    aligned_rot_angles = []
+    aligned_trans_mags = []
+
+    for name in shared:
+        T_A = poses_A[name]["extrinsic"]
+        T_B = poses_B[name]["extrinsic"]
+
+        R_A = T_A[:, :3]
+        t_A = T_A[:, 3]
+        R_B = T_B[:, :3]
+        t_B = T_B[:, 3]
+
+        # T_B_in_A = T_B * inv(T_AB_unified)
+        R_B_in_A = R_B @ R_AB_inv
+        t_B_in_A = t_B + R_B @ t_AB_inv
+
+        # 旋转误差: angle(R_A^T * R_B_in_A)
+        R_diff = R_A.T @ R_B_in_A
+        rot = Rotation.from_matrix(R_diff)
+        rot_angle = np.linalg.norm(rot.as_rotvec()) * 180 / np.pi
+
+        # 平移误差: ||t_A - t_B_in_A||
+        trans_mag = np.linalg.norm(t_A - t_B_in_A)
+
+        aligned_rot_angles.append(rot_angle)
+        aligned_trans_mags.append(trans_mag)
+
+    return np.array(aligned_rot_angles), np.array(aligned_trans_mags)
+
+
+def visualize_consistency(shared_names, rot_angles, trans_mags, cluster_a_name, cluster_b_name, output_dir,
+                          aligned_rot=None, aligned_trans=None):
+    """可视化两个 cluster 的 pose 一致性。如果提供了 aligned 数据，额外展示对齐后的结果。"""
     if plt is None:
         return
 
-    fig, axes = plt.subplots(2, 2, figsize=(16, 12))
+    has_aligned = aligned_rot is not None and aligned_trans is not None
+
+    if has_aligned:
+        fig, axes = plt.subplots(3, 2, figsize=(16, 18))
+    else:
+        fig, axes = plt.subplots(2, 2, figsize=(16, 12))
 
     x = np.arange(len(shared_names))
 
-    # --- 旋转角 ---
+    # --- 原始旋转角 ---
     axes[0, 0].bar(x, rot_angles, color="steelblue")
     axes[0, 0].set_xticks(x)
     axes[0, 0].set_xticklabels([f"{i}" for i in range(len(shared_names))], fontsize=7)
     axes[0, 0].set_ylabel("Rotation Angle (°)")
-    axes[0, 0].set_title(f"Relative Rotation Angle per Shared Image")
+    axes[0, 0].set_title("Raw Relative Rotation Angle")
     axes[0, 0].axhline(np.mean(rot_angles), color="r", linestyle="--", label=f"mean={np.mean(rot_angles):.2f}°")
     axes[0, 0].legend()
 
-    # --- 平移量 ---
+    # --- 原始平移量 ---
     axes[0, 1].bar(x, trans_mags, color="coral")
     axes[0, 1].set_xticks(x)
     axes[0, 1].set_xticklabels([f"{i}" for i in range(len(shared_names))], fontsize=7)
     axes[0, 1].set_ylabel("Translation Magnitude")
-    axes[0, 1].set_title(f"Relative Translation Magnitude per Shared Image")
+    axes[0, 1].set_title("Raw Relative Translation Magnitude")
     axes[0, 1].axhline(np.mean(trans_mags), color="r", linestyle="--", label=f"mean={np.mean(trans_mags):.4f}")
     axes[0, 1].legend()
 
@@ -133,7 +221,7 @@ def visualize_consistency(shared_names, rot_angles, trans_mags, cluster_a_name, 
     axes[1, 0].hist(rot_angles, bins=20, color="steelblue", edgecolor="black")
     axes[1, 0].set_xlabel("Rotation Angle (°)")
     axes[1, 0].set_ylabel("Count")
-    axes[1, 0].set_title("Rotation Angle Distribution")
+    axes[1, 0].set_title("Raw Rotation Angle Distribution")
     axes[1, 0].axvline(np.mean(rot_angles), color="r", linestyle="--", label=f"mean={np.mean(rot_angles):.2f}°")
     axes[1, 0].legend()
 
@@ -141,9 +229,29 @@ def visualize_consistency(shared_names, rot_angles, trans_mags, cluster_a_name, 
     axes[1, 1].hist(trans_mags, bins=20, color="coral", edgecolor="black")
     axes[1, 1].set_xlabel("Translation Magnitude")
     axes[1, 1].set_ylabel("Count")
-    axes[1, 1].set_title("Translation Magnitude Distribution")
+    axes[1, 1].set_title("Raw Translation Magnitude Distribution")
     axes[1, 1].axvline(np.mean(trans_mags), color="r", linestyle="--", label=f"mean={np.mean(trans_mags):.4f}")
     axes[1, 1].legend()
+
+    # --- 对齐后的结果（如果有） ---
+    if has_aligned:
+        # Aligned 旋转角
+        axes[2, 0].bar(x, aligned_rot, color="seagreen")
+        axes[2, 0].set_xticks(x)
+        axes[2, 0].set_xticklabels([f"{i}" for i in range(len(shared_names))], fontsize=7)
+        axes[2, 0].set_ylabel("Rotation Error (°)")
+        axes[2, 0].set_title("Aligned Rotation Error (T_B in A coords)")
+        axes[2, 0].axhline(np.mean(aligned_rot), color="r", linestyle="--", label=f"mean={np.mean(aligned_rot):.2f}°")
+        axes[2, 0].legend()
+
+        # Aligned 平移误差
+        axes[2, 1].bar(x, aligned_trans, color="mediumpurple")
+        axes[2, 1].set_xticks(x)
+        axes[2, 1].set_xticklabels([f"{i}" for i in range(len(shared_names))], fontsize=7)
+        axes[2, 1].set_ylabel("Translation Error")
+        axes[2, 1].set_title("Aligned Translation Error (T_B in A coords)")
+        axes[2, 1].axhline(np.mean(aligned_trans), color="r", linestyle="--", label=f"mean={np.mean(aligned_trans):.4f}")
+        axes[2, 1].legend()
 
     plt.suptitle(f"Pose Consistency: {cluster_a_name} vs {cluster_b_name}\n({len(shared_names)} shared images)",
                  fontsize=14, fontweight="bold")
@@ -213,8 +321,31 @@ def process_pair(cluster_a_dir, cluster_b_dir, output_dir):
     trans_threshold = 0.5  # 0.5米 (相对坐标系)
 
     consistent = (rot_angles < rot_threshold) & (trans_mags < trans_threshold)
-    print(f"\n  Consistency (rot<{rot_threshold}° & trans<{trans_threshold}):")
+    print(f"\n  Raw Consistency (rot<{rot_threshold}° & trans<{trans_threshold}):")
     print(f"    {consistent.sum()}/{len(shared)} ({consistent.sum()/len(shared)*100:.1f}%)")
+
+    # ---- 尺度统一 (Scale Alignment) ----
+    aligned_rot = None
+    aligned_trans = None
+    scale_aligned = False
+
+    if rot_angles.max() < rot_threshold:
+        print(f"\n  Rotation consistent (max={rot_angles.max():.3f}° < {rot_threshold}°). Performing scale alignment...")
+
+        T_AB_unified = align_scale(results)
+        aligned_rot, aligned_trans = evaluate_with_aligned_pose(poses_A, poses_B, shared, T_AB_unified)
+
+        scale_aligned = True
+        print(f"\n  Aligned Rotation Error (°):")
+        print(f"    mean={aligned_rot.mean():.3f}, std={aligned_rot.std():.3f}, "
+              f"min={aligned_rot.min():.3f}, max={aligned_rot.max():.3f}")
+        print(f"\n  Aligned Translation Error:")
+        print(f"    mean={aligned_trans.mean():.4f}, std={aligned_trans.std():.4f}, "
+              f"min={aligned_trans.min():.4f}, max={aligned_trans.max():.4f}")
+
+        aligned_consistent = (aligned_rot < rot_threshold) & (aligned_trans < trans_threshold)
+        print(f"\n  Aligned Consistency (rot<{rot_threshold}° & trans<{trans_threshold}):")
+        print(f"    {aligned_consistent.sum()}/{len(shared)} ({aligned_consistent.sum()/len(shared)*100:.1f}%)")
 
     # 保存结果
     os.makedirs(output_dir, exist_ok=True)
@@ -222,21 +353,40 @@ def process_pair(cluster_a_dir, cluster_b_dir, output_dir):
     with open(os.path.join(output_dir, "pose_consistency.txt"), "w") as f:
         f.write(f"# Pose Consistency: {cluster_a_name} vs {cluster_b_name}\n")
         f.write(f"# Shared images: {len(shared)}\n\n")
+
+        # Raw results
+        f.write("# Raw Results (T_AB = inv(T_A) * T_B per shared image)\n")
         f.write(f"{'Idx':<5} {'Name':<40} {'Rot(°)':<10} {'Trans':<10} {'Consistent':<12}\n")
         f.write("-" * 80 + "\n")
         for i, r in enumerate(results):
             cons = "YES" if consistent[i] else "NO"
             f.write(f"{i:<5} {r['name']:<40} {r['rot_angle']:<10.3f} {r['trans_mag']:<10.4f} {cons:<12}\n")
 
-        f.write("\n# Summary\n")
+        f.write("\n# Raw Summary\n")
         f.write(f"Rotation: mean={rot_angles.mean():.3f}°, std={rot_angles.std():.3f}°\n")
         f.write(f"Translation: mean={trans_mags.mean():.4f}, std={trans_mags.std():.4f}\n")
         f.write(f"Consistent: {consistent.sum()}/{len(shared)} ({consistent.sum()/len(shared)*100:.1f}%)\n")
 
+        # Aligned results
+        if scale_aligned:
+            f.write("\n" + "=" * 60 + "\n")
+            f.write("# Scale-Aligned Results (T_B transformed into A coords via unified T_AB)\n")
+            f.write(f"{'Idx':<5} {'Name':<40} {'RotErr(°)':<12} {'TransErr':<12} {'Consistent':<12}\n")
+            f.write("-" * 80 + "\n")
+            for i, name in enumerate(shared):
+                cons = "YES" if aligned_consistent[i] else "NO"
+                f.write(f"{i:<5} {name:<40} {aligned_rot[i]:<12.3f} {aligned_trans[i]:<12.4f} {cons:<12}\n")
+
+            f.write("\n# Aligned Summary\n")
+            f.write(f"Rotation Error: mean={aligned_rot.mean():.3f}°, std={aligned_rot.std():.3f}°\n")
+            f.write(f"Translation Error: mean={aligned_trans.mean():.4f}, std={aligned_trans.std():.4f}\n")
+            f.write(f"Consistent: {aligned_consistent.sum()}/{len(shared)} ({aligned_consistent.sum()/len(shared)*100:.1f}%)\n")
+
     print(f"\n  Report: {output_dir}/pose_consistency.txt")
 
     # 可视化
-    visualize_consistency(shared, rot_angles, trans_mags, cluster_a_name, cluster_b_name, output_dir)
+    visualize_consistency(shared, rot_angles, trans_mags, cluster_a_name, cluster_b_name, output_dir,
+                          aligned_rot=aligned_rot, aligned_trans=aligned_trans)
 
     return results
 
