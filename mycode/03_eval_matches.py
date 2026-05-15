@@ -187,7 +187,10 @@ def visualize_pair(
     """
     可视化一对图片的匹配和重投影误差。
 
-    画布: [image_i | image_j] 并列
+    画布分上下两部分:
+      上半: [image_i | image_j] 所有匹配连线（颜色表示正确性）
+      下半: [image_i | image_j] 只展示重投影（匹配点 + 重投影点 + 误差向量）
+
     连线颜色:
         绿色: 误差 < threshold/2  (正确匹配)
         黄色: threshold/2 <= 误差 < threshold  (边界)
@@ -196,19 +199,24 @@ def visualize_pair(
     """
     Hi, Wi = image_i.shape[:2]
     Hj, Wj = image_j.shape[:2]
-    H = max(Hi, Hj)
+    H_single = max(Hi, Hj)
+    W_total = Wi + Wj
 
-    # 创建白色画布
-    canvas = np.ones((H, Wi + Wj, 3), dtype=np.uint8) * 255
+    # 创建上下拼接的画布
+    canvas = np.ones((H_single * 2, W_total, 3), dtype=np.uint8) * 255
+    # 上半
     canvas[:Hi, :Wi] = image_i
     canvas[:Hj, Wi:] = image_j
+    # 下半
+    canvas[H_single:H_single + Hi, :Wi] = image_i
+    canvas[H_single:H_single + Hj, Wi:] = image_j
 
     n_total = len(mkpts_i)
     n_valid = int(valid_mask.sum())
     n_correct = int((valid_mask & (errors < threshold)).sum())
     mean_err = errors[valid_mask].mean() if n_valid > 0 else 0.0
 
-    # 画匹配线
+    # ---- 上半：匹配连线（原有逻辑）----
     for m in range(n_total):
         pt_i = tuple(mkpts_i[m].astype(int))
         pt_j = tuple((mkpts_j[m] + np.array([Wi, 0], dtype=np.float32)).astype(int))
@@ -230,27 +238,61 @@ def visualize_pair(
         cv2.circle(canvas, pt_i, 3, color, -1)
         cv2.circle(canvas, pt_j, 3, color, -1)
 
-        # 在错误匹配上标注重投影位置（红色小叉）
-        if valid_mask[m] and errors[m] >= threshold:
-            rp = tuple((reproj_pts[m] + np.array([Wi, 0], dtype=np.float32)).astype(int))
-            cv2.drawMarker(canvas, rp, (255, 0, 255), cv2.MARKER_CROSS, 6, 2)
-
-    # 添加统计文字
+    # 上半统计文字
     ratio = n_correct / n_total * 100 if n_total > 0 else 0
     text1 = f"Total: {n_total} | Valid: {n_valid} | Correct: {n_correct} ({ratio:.1f}%)"
     text2 = f"MeanErr: {mean_err:.2f}px | Threshold: {threshold}px"
 
-    # 文字背景
-    cv2.rectangle(canvas, (0, 0), (Wi + Wj, 50), (255, 255, 255), -1)
+    cv2.rectangle(canvas, (0, 0), (W_total, 50), (255, 255, 255), -1)
     cv2.putText(canvas, text1, (10, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 2)
     cv2.putText(canvas, text2, (10, 45), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 2)
 
-    # 图例
-    legend_y = H - 10
+    legend_y = H_single - 10
     cv2.putText(canvas, "Correct", (10, legend_y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, COLOR_CORRECT, 2)
     cv2.putText(canvas, "Border", (90, legend_y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, COLOR_BORDER, 2)
     cv2.putText(canvas, "Wrong", (170, legend_y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, COLOR_WRONG, 2)
     cv2.putText(canvas, "Invalid", (240, legend_y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, COLOR_INVALID, 2)
+
+    # ---- 下半：重投影专门展示（只画 valid 匹配）----
+    y_offset = H_single
+    n_reproj_valid = 0
+    n_reproj_wrong = 0
+
+    for m in range(n_total):
+        if not valid_mask[m]:
+            continue
+
+        n_reproj_valid += 1
+        pt_i = tuple(mkpts_i[m].astype(int))
+        pt_j = tuple((mkpts_j[m] + np.array([Wi, 0], dtype=np.float32)).astype(int))
+        rp = tuple((reproj_pts[m] + np.array([Wi, 0], dtype=np.float32)).astype(int))
+
+        if errors[m] >= threshold:
+            n_reproj_wrong += 1
+
+        # 下半部分坐标（加上 y_offset）
+        pt_i_lower = (pt_i[0], pt_i[1] + y_offset)
+        pt_j_lower = (pt_j[0], pt_j[1] + y_offset)
+        rp_lower = (rp[0], rp[1] + y_offset)
+
+        # image_i 侧：匹配点（绿色圆点，不连线）
+        cv2.circle(canvas, pt_i_lower, 3, COLOR_CORRECT, -1)
+
+        # image_j 侧：匹配点（绿色圆点）+ 重投影点（红色叉）+ 误差向量
+        cv2.circle(canvas, pt_j_lower, 3, COLOR_CORRECT, -1)
+        cv2.drawMarker(canvas, rp_lower, COLOR_WRONG, cv2.MARKER_CROSS, 6, 2)
+        cv2.line(canvas, pt_j_lower, rp_lower, (255, 0, 255), 1)
+
+    # 下半标题
+    cv2.rectangle(canvas, (0, y_offset), (W_total, y_offset + 30), (255, 255, 255), -1)
+    reproj_text = f"Reprojection Only (valid={n_reproj_valid}, wrong={n_reproj_wrong})"
+    cv2.putText(canvas, reproj_text, (10, y_offset + 22), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 2)
+
+    # 下半图例
+    legend_y2 = y_offset + H_single - 10
+    cv2.putText(canvas, "Match(Green)", (10, legend_y2), cv2.FONT_HERSHEY_SIMPLEX, 0.5, COLOR_CORRECT, 2)
+    cv2.putText(canvas, "Reproj(RedX)", (110, legend_y2), cv2.FONT_HERSHEY_SIMPLEX, 0.5, COLOR_WRONG, 2)
+    cv2.putText(canvas, "ErrorVec", (210, legend_y2), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 255), 1)
 
     cv2.imwrite(output_path, canvas)
     return n_total, n_valid, n_correct, mean_err
