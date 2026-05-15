@@ -85,6 +85,31 @@ Important utility modules:
 - `vggt/utils/geometry.py` — `unproject_depth_map_to_point_map()`, `closed_form_inverse_se3()`, and other 3D geometry helpers.
 - `visual_util.py` — converts predictions to GLB meshes for visualization.
 
+## Project Context (Custom Scripts)
+
+Scripts under `mycode/` implement a **cluster-based reconstruction pipeline** that:
+
+1. Uses **DINOv2 CLS features + Farthest Point Sampling (FPS)** to select overlapping image clusters
+2. Runs VGGT feed-forward reconstruction independently per cluster
+3. Evaluates intra-cluster quality with:
+   - `03_eval_matches.py`: SuperPoint + LightGlue matching with reprojection error (VGGT depth + pose)
+   - `04_depth_inconsistency.py`: Cross-frame depth consistency via reprojection
+   - `05_cluster_pose_consistency.py`: Inter-cluster pose consistency via shared images
+
+**Important**: The test datasets used in this project are **non-sequential** (unordered / non-consecutive). Cluster division must use **DINO feature similarity**, not sequential frame ordering. The `sequential` mode has been removed from `02_vggt_cluster.py` for this reason.
+
+Key script output directories (ignored by git via `.gitignore`):
+- `output_dino/` — DINO feature extraction cache
+- `output_vggt_cluster/` — per-cluster VGGT reconstruction results and evaluation outputs
+
+## Git Workflow (Claude Code)
+
+**DO NOT commit or push without explicit user approval.** This repository is actively developed and commits are intentionally kept small and focused. Before creating any commit:
+
+1. Ask the user if they want to commit the changes.
+2. If approved, squash or fixup any temporary / reverted changes before committing (e.g. do not leave "add feature X" followed by "remove feature X" in the history).
+3. Only push when the user explicitly requests it.
+
 ## Conventions
 
 - Images are expected in range `[0, 1]` with shape `[B, S, 3, H, W]` or `[S, 3, H, W]`.
