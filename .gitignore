@@ -156,3 +156,4 @@ input_*
 # Generated output directories
 output_dino/
 output_vggt_cluster/
+output_pose_consistency/
