@@ -111,7 +111,8 @@ def extract_dino_features(image_paths, model_name="dinov2_vitb14_reg", batch_siz
     return features
 
 
-def build_clusters(features, images_per_cluster=21, seed=42, num_clusters=None, min_coverage=1):
+def build_clusters(features, images_per_cluster=21, seed=42, num_clusters=None,
+                     min_coverage=1):
     """
     基于 DINO 特征迭代构建 clusters（允许 cluster 间重复）。
 
@@ -143,6 +144,10 @@ def build_clusters(features, images_per_cluster=21, seed=42, num_clusters=None, 
         visit_count: (N,) 每张图片被包含的 cluster 数量
     """
     N = features.shape[0]
+
+    # ===================================================================
+    # 基于 DINO 特征相似度选邻居 + FPS 选 anchor
+    # ===================================================================
     rng = np.random.RandomState(seed)
 
     # 归一化特征并计算余弦距离矩阵
